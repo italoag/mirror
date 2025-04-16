@@ -35,27 +35,33 @@ jobs:
         run: |
           # Usa inputs do workflow_dispatch se disponíveis
           if [[ -n "${{ github.event.inputs.image_name }}" ]]; then
-            echo "IMAGE_NAME=${{ github.event.inputs.image_name }}" >> $GITHUB_ENV
-            echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> $GITHUB_ENV
+            IMAGE_NAME="${{ github.event.inputs.image_name }}"
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
           # Usa dados do repository_dispatch
           elif [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
-            echo "IMAGE_NAME=${{ github.event.client_payload.image_name }}" >> $GITHUB_ENV
-            echo "IMAGE_TAG=${{ github.event.client_payload.image_tag }}" >> $GITHUB_ENV
+            IMAGE_NAME="${{ github.event.client_payload.image_name }}"
+            IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
           # Para execução agendada, verificar imagens predefinidas
           else
             # Lista de imagens a verificar na execução agendada
-            # Isso poderia ser substituído por uma lógica que lê um arquivo de configuração
-            echo "Executando verificação agendada para todas as imagens predefinidas"
-            # Exemplo para demonstração - na prática, você teria um loop para processar várias imagens
-            echo "IMAGE_NAME=postgres" >> $GITHUB_ENV
-            echo "IMAGE_TAG=14.7" >> $GITHUB_ENV
+            IMAGE_NAME="postgres"
+            IMAGE_TAG="14.7"
           fi
           
-          # Define os nomes completos das imagens
-          echo "DOCKERHUB_IMAGE=${IMAGE_NAME}:${IMAGE_TAG}" >> $GITHUB_ENV
-          echo "GHCR_IMAGE=ghcr.io/italoag/public/${IMAGE_NAME}:${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
           
+          # Define os nomes completos das imagens explicitamente
+          DOCKERHUB_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+          GHCR_IMAGE="ghcr.io/italoag/public/${IMAGE_NAME}:${IMAGE_TAG}"
+          
+          echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE}" >> $GITHUB_ENV
+          echo "GHCR_IMAGE=${GHCR_IMAGE}" >> $GITHUB_ENV
+          
+          # Log para depuração
           echo "Imagem definida: ${IMAGE_NAME}:${IMAGE_TAG}"
+          echo "Docker Hub: ${DOCKERHUB_IMAGE}"
+          echo "GHCR: ${GHCR_IMAGE}"
       
       - name: Verificar se a imagem existe no GHCR
         id: check-ghcr
@@ -76,19 +82,49 @@ jobs:
             echo "Imagem não encontrada no GHCR (Status: $STATUS_CODE)"
           fi
       
-      - name: Sincronizar imagem do Docker Hub para GHCR
+      - name: Verificar imagem no Docker Hub
         if: env.IMAGEM_EXISTE == 'false'
+        id: check-dockerhub
+        run: |
+          # A API correta do Docker Hub para verificar tags é diferente
+          # Usamos a API v2 do Docker Registry 
+          
+          # Primeiro, vamos obter o token de autenticação para acessar o Registry
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/${{ env.IMAGE_NAME }}:pull" | jq -r .token)
+          
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "Erro ao obter token de autenticação para o Docker Hub"
+            exit 1
+          fi
+          
+          # Agora verificamos se o manifesto existe
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://registry-1.docker.io/v2/library/${{ env.IMAGE_NAME }}/manifests/${{ env.IMAGE_TAG }}")
+          
+          echo "Docker Hub Status: $STATUS_CODE"
+          
+          if [[ "$STATUS_CODE" == "200" || "$STATUS_CODE" == "307" ]]; then
+            echo "DOCKERHUB_EXISTE=true" >> $GITHUB_ENV
+            echo "Imagem encontrada no Docker Hub"
+          else
+            echo "DOCKERHUB_EXISTE=false" >> $GITHUB_ENV
+            echo "Imagem não encontrada no Docker Hub (Status: $STATUS_CODE)"
+            exit 1
+          fi
+      
+      - name: Sincronizar imagem do Docker Hub para GHCR
+        if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
         run: |
           echo "Iniciando sincronização da imagem do Docker Hub para GHCR"
           
-          # Verificar se a imagem existe no Docker Hub antes de tentar puxá-la
-          DOCKERHUB_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            https://hub.docker.com/v2/repositories/library/${{ env.IMAGE_NAME }}/tags/${{ env.IMAGE_TAG }})
-          
-          if [[ "$DOCKERHUB_STATUS" != "200" ]]; then
-            echo "Erro: Imagem não encontrada no Docker Hub. Status: $DOCKERHUB_STATUS"
-            exit 1
-          fi
+          # Depuração das variáveis de ambiente
+          echo "Variáveis de ambiente:"
+          echo "IMAGE_NAME: ${{ env.IMAGE_NAME }}"
+          echo "IMAGE_TAG: ${{ env.IMAGE_TAG }}"
+          echo "DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}"
+          echo "GHCR_IMAGE: ${{ env.GHCR_IMAGE }}"
           
           # Puxar a imagem do Docker Hub
           echo "Puxando imagem do Docker Hub: ${{ env.DOCKERHUB_IMAGE }}"
@@ -112,16 +148,8 @@ jobs:
         run: |
           if [[ "${{ env.IMAGEM_EXISTE }}" == "true" ]]; then
             echo "A imagem já existe no GHCR, nenhuma ação necessária."
+          elif [[ "${{ env.DOCKERHUB_EXISTE }}" != "true" ]]; then
+            echo "Erro: A imagem não foi encontrada no Docker Hub."
           else
             echo "Imagem sincronizada com sucesso do Docker Hub para o GHCR."
           fi
-      
-      - name: Configurar logs e notificações
-        if: always()
-        run: |
-          # Registrar o resultado da operação para fins de monitoramento
-          echo "Registro de atividade: $(date) - Processado ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} - Status: ${{ job.status }}" >> sync_log.txt
-          
-          # Você poderia adicionar integração com sistemas de notificação
-          # Por exemplo: enviar para Slack, MS Teams, email, etc.
-          # curl -X POST -H 'Content-type: application/json' --data '{"text":"Sincronização de imagem ${{ env.GHCR_IMAGE }} - Status: ${{ job.status }}"}' $WEBHOOK_URL
