@@ -5,10 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       image_name:
-        description: 'Nome da imagem (ex: postgres)'
+        description: 'Nome da imagem (ex: ethereum/client-go)'
         required: true
       image_tag:
-        description: 'Tag da imagem (ex: 14.7)'
+        description: 'Tag da imagem (ex: release-1.10)'
         required: true
   
   # Executa diariamente às 2h da manhã
@@ -24,14 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Verificar configuração
-        run: |
-          if [[ -n "${{ secrets.GHCR_PAT }}" ]]; then
-            echo "✅ GHCR_PAT está configurado (valor não será mostrado por segurança)"
-          else
-            echo "❌ GHCR_PAT não está configurado"
-            exit 1
-          fi
       - name: Checkout repository
         uses: actions/checkout@v4
       
@@ -52,35 +44,41 @@ jobs:
           # Para execução agendada, verificar imagens predefinidas
           else
             # Lista de imagens a verificar na execução agendada
-            IMAGE_NAME="postgres"
-            IMAGE_TAG="14.7"
+            IMAGE_NAME="ethereum/client-go"
+            IMAGE_TAG="release-1.10"
           fi
           
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
           
-          # Define os nomes completos das imagens explicitamente
-          DOCKERHUB_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+          # Para GHCR, mantemos o formato completo
           GHCR_IMAGE="ghcr.io/italoag/public/${IMAGE_NAME}:${IMAGE_TAG}"
-          
-          echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE}" >> $GITHUB_ENV
           echo "GHCR_IMAGE=${GHCR_IMAGE}" >> $GITHUB_ENV
           
           # Log para depuração
           echo "Imagem definida: ${IMAGE_NAME}:${IMAGE_TAG}"
-          echo "Docker Hub: ${DOCKERHUB_IMAGE}"
-          echo "GHCR: ${GHCR_IMAGE}"
+          echo "GHCR destino: ${GHCR_IMAGE}"
       
       - name: Verificar se a imagem existe no GHCR
         id: check-ghcr
         continue-on-error: true
         run: |
+          # Extrair caminho da imagem para o GHCR
+          if [[ "${{ env.IMAGE_NAME }}" == *"/"* ]]; then
+            # Imagem com namespace (ex: ethereum/client-go)
+            GHCR_PATH="italoag/public/${{ env.IMAGE_NAME }}"
+          else
+            # Imagem simples (ex: postgres)
+            GHCR_PATH="italoag/public/${{ env.IMAGE_NAME }}"
+          fi
+          
           # Verificação HTTP para o manifesto da imagem no GHCR
           STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
-            https://ghcr.io/v2/italoag/public/${{ env.IMAGE_NAME }}/manifests/${{ env.IMAGE_TAG }})
+            "https://ghcr.io/v2/${GHCR_PATH}/manifests/${{ env.IMAGE_TAG }}")
           
-          echo "Status HTTP: $STATUS_CODE"
+          echo "Status HTTP GHCR: $STATUS_CODE"
+          echo "URL verificada: https://ghcr.io/v2/${GHCR_PATH}/manifests/${{ env.IMAGE_TAG }}"
           
           if [[ "$STATUS_CODE" == "200" ]]; then
             echo "IMAGEM_EXISTE=true" >> $GITHUB_ENV
@@ -94,31 +92,45 @@ jobs:
         if: env.IMAGEM_EXISTE == 'false'
         id: check-dockerhub
         run: |
-          # A API correta do Docker Hub para verificar tags é diferente
-          # Usamos a API v2 do Docker Registry 
+          # Determinar se a imagem é oficial ou de namespace personalizado
+          if [[ "${{ env.IMAGE_NAME }}" == *"/"* ]]; then
+            # Imagem com namespace personalizado (ex: ethereum/client-go)
+            NAMESPACE=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f1)
+            IMAGE_SHORT=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f2-)
+            DOCKERHUB_REPO="${NAMESPACE}/${IMAGE_SHORT}"
+            DOCKERHUB_SCOPE="repository:${DOCKERHUB_REPO}:pull"
+          else
+            # Imagem oficial (ex: postgres, nginx)
+            DOCKERHUB_REPO="library/${{ env.IMAGE_NAME }}"
+            DOCKERHUB_SCOPE="repository:${DOCKERHUB_REPO}:pull"
+          fi
           
-          # Primeiro, vamos obter o token de autenticação para acessar o Registry
-          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/${{ env.IMAGE_NAME }}:pull" | jq -r .token)
+          echo "Verificando imagem no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }}"
+          
+          # Obter token de autenticação para o Docker Hub
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=${DOCKERHUB_SCOPE}" | jq -r .token)
           
           if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
             echo "Erro ao obter token de autenticação para o Docker Hub"
+            echo "Escopo usado: ${DOCKERHUB_SCOPE}"
             exit 1
           fi
           
-          # Agora verificamos se o manifesto existe
+          # Verificar se o manifesto existe no Docker Hub
           STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-            "https://registry-1.docker.io/v2/library/${{ env.IMAGE_NAME }}/manifests/${{ env.IMAGE_TAG }}")
+            "https://registry-1.docker.io/v2/${DOCKERHUB_REPO}/manifests/${{ env.IMAGE_TAG }}")
           
           echo "Docker Hub Status: $STATUS_CODE"
           
           if [[ "$STATUS_CODE" == "200" || "$STATUS_CODE" == "307" ]]; then
             echo "DOCKERHUB_EXISTE=true" >> $GITHUB_ENV
-            echo "Imagem encontrada no Docker Hub"
+            echo "DOCKERHUB_REPO=${DOCKERHUB_REPO}" >> $GITHUB_ENV
+            echo "Imagem encontrada no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }}"
           else
             echo "DOCKERHUB_EXISTE=false" >> $GITHUB_ENV
-            echo "Imagem não encontrada no Docker Hub (Status: $STATUS_CODE)"
+            echo "Imagem não encontrada no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }} (Status: $STATUS_CODE)"
             exit 1
           fi
       
@@ -140,16 +152,19 @@ jobs:
           echo "Variáveis de ambiente:"
           echo "IMAGE_NAME: ${{ env.IMAGE_NAME }}"
           echo "IMAGE_TAG: ${{ env.IMAGE_TAG }}"
-          echo "DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}"
+          echo "DOCKERHUB_REPO: ${{ env.DOCKERHUB_REPO }}"
           echo "GHCR_IMAGE: ${{ env.GHCR_IMAGE }}"
           
+          # Construir o nome completo da imagem no Docker Hub
+          DOCKERHUB_FULL="${{ env.DOCKERHUB_REPO }}:${{ env.IMAGE_TAG }}"
+          
           # Puxar a imagem do Docker Hub
-          echo "Puxando imagem do Docker Hub: ${{ env.DOCKERHUB_IMAGE }}"
-          docker pull ${{ env.DOCKERHUB_IMAGE }}
+          echo "Puxando imagem do Docker Hub: ${DOCKERHUB_FULL}"
+          docker pull ${DOCKERHUB_FULL}
           
           # Aplicar tag para GHCR
           echo "Aplicando tag para GHCR: ${{ env.GHCR_IMAGE }}"
-          docker tag ${{ env.DOCKERHUB_IMAGE }} ${{ env.GHCR_IMAGE }}
+          docker tag ${DOCKERHUB_FULL} ${{ env.GHCR_IMAGE }}
           
           # Enviar a imagem para o GHCR
           echo "Enviando imagem para o GHCR"
