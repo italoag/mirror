@@ -24,6 +24,14 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+      - name: Verificar configuração
+        run: |
+          if [[ -n "${{ secrets.GHCR_PAT }}" ]]; then
+            echo "✅ GHCR_PAT está configurado (valor não será mostrado por segurança)"
+          else
+            echo "❌ GHCR_PAT não está configurado"
+            exit 1
+          fi
       - name: Checkout repository
         uses: actions/checkout@v4
       
