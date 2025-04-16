@@ -114,6 +114,15 @@ jobs:
             exit 1
           fi
       
+      # Usar a action oficial do Docker para login no GHCR
+      - name: Login no GHCR
+        if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+      
       - name: Sincronizar imagem do Docker Hub para GHCR
         if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
         run: |
@@ -133,10 +142,6 @@ jobs:
           # Aplicar tag para GHCR
           echo "Aplicando tag para GHCR: ${{ env.GHCR_IMAGE }}"
           docker tag ${{ env.DOCKERHUB_IMAGE }} ${{ env.GHCR_IMAGE }}
-          
-          # Login no GHCR usando o Personal Access Token
-          echo "Efetuando login no GHCR"
-          echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u italoag --password-stdin
           
           # Enviar a imagem para o GHCR
           echo "Enviando imagem para o GHCR"
