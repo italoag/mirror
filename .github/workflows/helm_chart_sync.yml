@@ -1,0 +1,119 @@
+name: Helm Chart Sync to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      chart_repo:
+        description: 'Repositório do chart (ex: bitnamicharts/mongodb)'
+        required: true
+      chart_version:
+        description: 'Versão do chart (ex: 16.5.1)'
+        required: true
+      force_resync:
+        description: 'Forçar ressincronização mesmo se já existir'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  sync-helm-chart:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+      
+      - name: Definir informações do chart
+        id: set-chart-info
+        run: |
+          CHART_REPO="${{ github.event.inputs.chart_repo }}"
+          CHART_VERSION="${{ github.event.inputs.chart_version }}"
+          FORCE_RESYNC="${{ github.event.inputs.force_resync }}"
+          
+          echo "CHART_REPO=${CHART_REPO}" >> $GITHUB_ENV
+          echo "CHART_VERSION=${CHART_VERSION}" >> $GITHUB_ENV
+          echo "FORCE_RESYNC=${FORCE_RESYNC}" >> $GITHUB_ENV
+          
+          # Extrair nome do chart da última parte do caminho do repositório
+          CHART_NAME=$(echo ${CHART_REPO} | awk -F'/' '{print $NF}')
+          echo "CHART_NAME=${CHART_NAME}" >> $GITHUB_ENV
+          
+          # Montar URL de origem e destino
+          SOURCE_URL="oci://registry-1.docker.io/${CHART_REPO}"
+          TARGET_URL="oci://ghcr.io/italoag/public/charts/${CHART_NAME}"
+          echo "SOURCE_URL=${SOURCE_URL}" >> $GITHUB_ENV
+          echo "TARGET_URL=${TARGET_URL}" >> $GITHUB_ENV
+          
+          echo "Helm Chart a sincronizar: ${CHART_REPO}:${CHART_VERSION}"
+          echo "Origem: ${SOURCE_URL}"
+          echo "Destino: ${TARGET_URL}"
+      
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+      
+      - name: Verificar se o chart existe no GHCR
+        id: check-chart-exists
+        continue-on-error: true
+        run: |
+          # Verificar se o chart já existe no destino
+          if [[ "${{ env.FORCE_RESYNC }}" != "true" ]]; then
+            if helm pull ${{ env.TARGET_URL }} --version ${{ env.CHART_VERSION }} 2>/dev/null; then
+              echo "CHART_EXISTE=true" >> $GITHUB_ENV
+              echo "O chart já existe no GHCR. Pulando sincronização."
+            else
+              echo "CHART_EXISTE=false" >> $GITHUB_ENV
+              echo "O chart não existe no GHCR."
+            fi
+          else
+            echo "CHART_EXISTE=false" >> $GITHUB_ENV
+            echo "Forçando ressincronização."
+          fi
+      
+      - name: Sincronizar Helm Chart para GHCR
+        if: env.CHART_EXISTE != 'true'
+        run: |
+          echo "Iniciando sincronização do Helm Chart para GHCR"
+          
+          # Criar diretório temporário para trabalhar
+          TEMP_DIR=$(mktemp -d)
+          cd $TEMP_DIR
+          
+          # Puxar o chart da origem
+          echo "Baixando chart da origem..."
+          helm pull ${{ env.SOURCE_URL }} --version ${{ env.CHART_VERSION }} --destination $TEMP_DIR
+          
+          # Obter nome do arquivo baixado
+          CHART_FILE=$(ls *.tgz)
+          echo "Chart baixado: ${CHART_FILE}"
+          
+          # Enviar o chart para o destino
+          echo "Enviando chart para o GHCR..."
+          helm push ${CHART_FILE} ${{ env.TARGET_URL }}
+          
+          # Limpar
+          cd - && rm -rf $TEMP_DIR
+          
+          echo "Sincronização do Helm Chart concluída com sucesso"
+      
+      - name: Resultado
+        run: |
+          if [[ "${{ env.CHART_EXISTE }}" == "true" ]]; then
+            echo "O Helm Chart já existe no GHCR, nenhuma ação adicional realizada."
+          else
+            echo "Helm Chart '${{ env.CHART_REPO }}' versão ${{ env.CHART_VERSION }} sincronizado com sucesso para o GHCR."
+          fi
