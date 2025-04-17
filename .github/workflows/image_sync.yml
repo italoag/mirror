@@ -102,7 +102,7 @@ jobs:
             echo "IMAGEM_EXISTE=false" >> $GITHUB_ENV
           fi
       
-      - name: Verificar imagem no Docker Hub
+      - name: Verificar imagem no Docker Hub e analisar plataformas
         if: env.IMAGEM_EXISTE == 'false'
         id: check-dockerhub
         run: |
@@ -133,7 +133,7 @@ jobs:
           # Verificar se o manifesto existe no Docker Hub
           STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
             "https://registry-1.docker.io/v2/${DOCKERHUB_REPO}/manifests/${{ env.IMAGE_TAG }}")
           
           echo "Docker Hub Status: $STATUS_CODE"
@@ -142,6 +142,36 @@ jobs:
             echo "DOCKERHUB_EXISTE=true" >> $GITHUB_ENV
             echo "DOCKERHUB_REPO=${DOCKERHUB_REPO}" >> $GITHUB_ENV
             echo "Imagem encontrada no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }}"
+            
+            # Obter e analisar o manifesto para identificar plataformas suportadas
+            MANIFEST=$(curl -s \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://registry-1.docker.io/v2/${DOCKERHUB_REPO}/manifests/${{ env.IMAGE_TAG }}")
+            
+            # Verificar se é um manifesto de lista (multi-arquitetura)
+            if echo "$MANIFEST" | jq -e '.manifests' > /dev/null; then
+              echo "A imagem é multi-arquitetura. Plataformas disponíveis:"
+              echo "$MANIFEST" | jq -r '.manifests[] | "- \(.platform.os)/\(.platform.architecture)\(.platform.variant // "")"'
+              
+              # Verificar se ARM64 está disponível
+              if echo "$MANIFEST" | jq -e '.manifests[] | select(.platform.architecture=="arm64")' > /dev/null; then
+                echo "ARM64 está disponível para esta imagem"
+                echo "ARM64_DISPONIVEL=true" >> $GITHUB_ENV
+              else
+                echo "ARM64 NÃO está disponível para esta imagem"
+                echo "ARM64_DISPONIVEL=false" >> $GITHUB_ENV
+              fi
+            else
+              echo "A imagem tem apenas uma arquitetura:"
+              echo "$MANIFEST" | jq -r '.architecture'
+              
+              if [[ "$(echo "$MANIFEST" | jq -r '.architecture')" == "arm64" ]]; then
+                echo "ARM64_DISPONIVEL=true" >> $GITHUB_ENV
+              else
+                echo "ARM64_DISPONIVEL=false" >> $GITHUB_ENV
+              fi
+            fi
           else
             echo "DOCKERHUB_EXISTE=false" >> $GITHUB_ENV
             echo "Imagem não encontrada no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }} (Status: $STATUS_CODE)"
@@ -157,27 +187,44 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
       
+      # Login no Docker Hub para garantir acesso completo às imagens
+      - name: Login no Docker Hub
+        if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
       - name: Sincronizar imagem multi-arquitetura do Docker Hub para GHCR
         if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
         run: |
           echo "Iniciando sincronização da imagem do Docker Hub para GHCR (com suporte multi-arquitetura)"
           
-          # Configurar buildx para suporte multi-arquitetura
-          docker buildx create --use --name multi-arch-builder
+          # Configurar buildx para melhor suporte multi-arquitetura
+          docker buildx create --use --name multi-arch-builder --driver docker-container --bootstrap
           
-          # Se estamos forçando ressincronização e a imagem já existe, vamos excluí-la primeiro
-          if [[ "${{ env.FORCE_RESYNC }}" == "true" ]]; then
-            echo "Forçando ressincronização - tentando remover a imagem existente primeiro"
-            # Isso é apenas para log, a operação seguinte sobrescreverá a imagem existente
-          fi
+          SOURCE_IMAGE="docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.IMAGE_TAG }}"
+          TARGET_IMAGE="${{ env.GHCR_IMAGE }}"
           
-          # Usar buildx imagetools para copiar a imagem com todas as arquiteturas disponíveis
-          # Esta abordagem preserva o manifesto multi-plataforma se existir
-          docker buildx imagetools create \
-            --tag ${{ env.GHCR_IMAGE }} \
-            docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.IMAGE_TAG }}
+          # Inspecionar a imagem de origem para depuração
+          echo "Inspecionando o manifesto da imagem de origem:"
+          docker buildx imagetools inspect $SOURCE_IMAGE --raw
           
-          echo "Sincronização com suporte multi-arquitetura completa para: ${{ env.GHCR_IMAGE }}"
+          # Usar uma abordagem mais direta para copiar a imagem com todas as arquiteturas
+          echo "Copiando a imagem com todas as arquiteturas disponíveis..."
+          
+          # Melhor abordagem com skopeo (mais confiável para copiar manifestos multi-plataforma)
+          # Instalar skopeo
+          sudo apt-get update && sudo apt-get install -y skopeo
+          
+          # Copiar imagem usando skopeo (preserva todos os manifests)
+          skopeo copy --all docker://$SOURCE_IMAGE docker://$TARGET_IMAGE
+          
+          echo "Sincronização com suporte multi-arquitetura completa para: $TARGET_IMAGE"
+          
+          # Verificar se a imagem de destino foi sincronizada corretamente
+          echo "Inspecionando o manifesto da imagem sincronizada:"
+          docker buildx imagetools inspect $TARGET_IMAGE
       
       - name: Resultado da verificação
         run: |
@@ -187,6 +234,13 @@ jobs:
             echo "Erro: A imagem não foi encontrada no Docker Hub."
           else
             echo "Imagem sincronizada com sucesso do Docker Hub para o GHCR."
+            
+            if [[ "${{ env.ARM64_DISPONIVEL }}" == "true" ]]; then
+              echo "A imagem inclui suporte para ARM64 (Apple Silicon)."
+            else
+              echo "ATENÇÃO: A imagem original NÃO tem suporte para ARM64 (Apple Silicon)."
+            fi
+            
             if [[ "${{ env.FORCE_RESYNC }}" == "true" ]]; then
               echo "A ressincronização forçada foi concluída."
             fi
