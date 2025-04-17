@@ -10,6 +10,11 @@ on:
       image_tag:
         description: 'Tag da imagem (ex: release-1.10)'
         required: true
+      force_resync:
+        description: 'Forçar ressincronização mesmo se a imagem já existir'
+        required: false
+        type: boolean
+        default: false
   
   # Executa diariamente às 2h da manhã
   schedule:
@@ -37,19 +42,23 @@ jobs:
           if [[ -n "${{ github.event.inputs.image_name }}" ]]; then
             IMAGE_NAME="${{ github.event.inputs.image_name }}"
             IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+            FORCE_RESYNC="${{ github.event.inputs.force_resync }}"
           # Usa dados do repository_dispatch
           elif [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
             IMAGE_NAME="${{ github.event.client_payload.image_name }}"
             IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
+            FORCE_RESYNC="${{ github.event.client_payload.force_resync || 'false' }}"
           # Para execução agendada, verificar imagens predefinidas
           else
             # Lista de imagens a verificar na execução agendada
             IMAGE_NAME="ethereum/client-go"
             IMAGE_TAG="release-1.10"
+            FORCE_RESYNC="false"
           fi
           
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "FORCE_RESYNC=${FORCE_RESYNC}" >> $GITHUB_ENV
           
           # Para GHCR, mantemos o formato completo
           GHCR_IMAGE="ghcr.io/italoag/public/${IMAGE_NAME}:${IMAGE_TAG}"
@@ -58,6 +67,7 @@ jobs:
           # Log para depuração
           echo "Imagem definida: ${IMAGE_NAME}:${IMAGE_TAG}"
           echo "GHCR destino: ${GHCR_IMAGE}"
+          echo "Forçar ressincronização: ${FORCE_RESYNC}"
       
       - name: Verificar se a imagem existe no GHCR
         id: check-ghcr
@@ -80,12 +90,16 @@ jobs:
           echo "Status HTTP GHCR: $STATUS_CODE"
           echo "URL verificada: https://ghcr.io/v2/${GHCR_PATH}/manifests/${{ env.IMAGE_TAG }}"
           
-          if [[ "$STATUS_CODE" == "200" ]]; then
+          if [[ "$STATUS_CODE" == "200" && "${{ env.FORCE_RESYNC }}" != "true" ]]; then
             echo "IMAGEM_EXISTE=true" >> $GITHUB_ENV
-            echo "Imagem encontrada no GHCR"
+            echo "Imagem encontrada no GHCR e ressincronização não forçada"
           else
+            if [[ "$STATUS_CODE" == "200" && "${{ env.FORCE_RESYNC }}" == "true" ]]; then
+              echo "Imagem encontrada no GHCR, mas será ressincronizada devido à flag de força"
+            else
+              echo "Imagem não encontrada no GHCR (Status: $STATUS_CODE)"
+            fi
             echo "IMAGEM_EXISTE=false" >> $GITHUB_ENV
-            echo "Imagem não encontrada no GHCR (Status: $STATUS_CODE)"
           fi
       
       - name: Verificar imagem no Docker Hub
@@ -143,34 +157,27 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
       
-      - name: Sincronizar imagem do Docker Hub para GHCR
+      - name: Sincronizar imagem multi-arquitetura do Docker Hub para GHCR
         if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
         run: |
-          echo "Iniciando sincronização da imagem do Docker Hub para GHCR"
+          echo "Iniciando sincronização da imagem do Docker Hub para GHCR (com suporte multi-arquitetura)"
           
-          # Depuração das variáveis de ambiente
-          echo "Variáveis de ambiente:"
-          echo "IMAGE_NAME: ${{ env.IMAGE_NAME }}"
-          echo "IMAGE_TAG: ${{ env.IMAGE_TAG }}"
-          echo "DOCKERHUB_REPO: ${{ env.DOCKERHUB_REPO }}"
-          echo "GHCR_IMAGE: ${{ env.GHCR_IMAGE }}"
+          # Configurar buildx para suporte multi-arquitetura
+          docker buildx create --use --name multi-arch-builder
           
-          # Construir o nome completo da imagem no Docker Hub
-          DOCKERHUB_FULL="${{ env.DOCKERHUB_REPO }}:${{ env.IMAGE_TAG }}"
+          # Se estamos forçando ressincronização e a imagem já existe, vamos excluí-la primeiro
+          if [[ "${{ env.FORCE_RESYNC }}" == "true" ]]; then
+            echo "Forçando ressincronização - tentando remover a imagem existente primeiro"
+            # Isso é apenas para log, a operação seguinte sobrescreverá a imagem existente
+          fi
           
-          # Puxar a imagem do Docker Hub
-          echo "Puxando imagem do Docker Hub: ${DOCKERHUB_FULL}"
-          docker pull ${DOCKERHUB_FULL}
+          # Usar buildx imagetools para copiar a imagem com todas as arquiteturas disponíveis
+          # Esta abordagem preserva o manifesto multi-plataforma se existir
+          docker buildx imagetools create \
+            --tag ${{ env.GHCR_IMAGE }} \
+            docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.IMAGE_TAG }}
           
-          # Aplicar tag para GHCR
-          echo "Aplicando tag para GHCR: ${{ env.GHCR_IMAGE }}"
-          docker tag ${DOCKERHUB_FULL} ${{ env.GHCR_IMAGE }}
-          
-          # Enviar a imagem para o GHCR
-          echo "Enviando imagem para o GHCR"
-          docker push ${{ env.GHCR_IMAGE }}
-          
-          echo "Sincronização completa para: ${{ env.GHCR_IMAGE }}"
+          echo "Sincronização com suporte multi-arquitetura completa para: ${{ env.GHCR_IMAGE }}"
       
       - name: Resultado da verificação
         run: |
@@ -180,4 +187,7 @@ jobs:
             echo "Erro: A imagem não foi encontrada no Docker Hub."
           else
             echo "Imagem sincronizada com sucesso do Docker Hub para o GHCR."
+            if [[ "${{ env.FORCE_RESYNC }}" == "true" ]]; then
+              echo "A ressincronização forçada foi concluída."
+            fi
           fi
