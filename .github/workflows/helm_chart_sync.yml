@@ -18,6 +18,9 @@ on:
 jobs:
   sync-helm-chart:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     
     steps:
       - name: Checkout repository
@@ -27,6 +30,7 @@ jobs:
         uses: azure/setup-helm@v3
         with:
           version: 'latest'
+          token: ${{ github.token }}  # Aqui está a correção - fornecendo o token
       
       - name: Definir informações do chart
         id: set-chart-info
@@ -66,6 +70,15 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
       
+      - name: Configurar Helm para login em registros OCI
+        run: |
+          # Garantir que o Helm use as credenciais do Docker (necessário para OCI)
+          echo "Configurando Helm para usar credenciais do Docker para registros OCI"
+          mkdir -p ~/.config/helm
+          echo 'registry:
+            enabled: true
+          ' > ~/.config/helm/repositories.yaml
+      
       - name: Verificar se o chart existe no GHCR
         id: check-chart-exists
         continue-on-error: true
@@ -101,6 +114,10 @@ jobs:
           CHART_FILE=$(ls *.tgz)
           echo "Chart baixado: ${CHART_FILE}"
           
+          # Mostrar conteúdo do chart para depuração
+          echo "Conteúdo do chart:"
+          tar -tvf ${CHART_FILE}
+          
           # Enviar o chart para o destino
           echo "Enviando chart para o GHCR..."
           helm push ${CHART_FILE} ${{ env.TARGET_URL }}
@@ -116,4 +133,6 @@ jobs:
             echo "O Helm Chart já existe no GHCR, nenhuma ação adicional realizada."
           else
             echo "Helm Chart '${{ env.CHART_REPO }}' versão ${{ env.CHART_VERSION }} sincronizado com sucesso para o GHCR."
+            echo "O chart está disponível em: ${{ env.TARGET_URL }}"
+            echo "Pode ser usado com: helm pull ${{ env.TARGET_URL }} --version ${{ env.CHART_VERSION }}"
           fi
