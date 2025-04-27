@@ -57,76 +57,90 @@ jobs:
             echo "🔄 Forçando ressincronização"
           fi
       
-      - name: Download e Sincronização do Modelo
+      - name: Configurar Ambiente para Ollama
         if: env.EXISTS == 'false'
         run: |
-          echo "🔄 Iniciando processo de sincronização para modelo ${MODEL_FULL}"
+          # Instalar Ollama localmente
+          curl -fsSL https://ollama.com/install.sh | sh
           
           # Criar diretórios de trabalho
           mkdir -p /tmp/ollama-data
           mkdir -p /tmp/model-files
           
-          # Executar container Docker com Ollama e baixar o modelo
+          # Inicie o serviço Ollama
+          echo "🚀 Iniciando o serviço Ollama..."
+          ollama serve &
+          sleep 5
+          
+          # Baixar o modelo
           echo "📥 Baixando modelo ${MODEL_FULL}..."
-          docker run --name ollama-downloader \
-            -v /tmp/ollama-data:/root/.ollama \
-            ollama/ollama bash -c "ollama serve & sleep 5 && ollama pull ${MODEL_FULL} && sleep 2"
+          ollama pull ${MODEL_FULL}
           
-          # Listar estrutura de diretórios para debug
-          echo "🔍 Estrutura de diretórios de volume do Ollama:"
-          find /tmp/ollama-data -type d | sort
+          # Encontrar diretório onde o Ollama armazena os modelos
+          OLLAMA_DIR="$HOME/.ollama"
+          echo "🔍 Verificando diretório do Ollama: ${OLLAMA_DIR}"
           
-          # Explorar e listar todos os arquivos grandes
-          echo "🔍 Procurando arquivos de modelo (>= 1MB):"
-          find /tmp/ollama-data -type f -size +1M | sort
+          # Verificar estrutura de diretórios
+          echo "📂 Estrutura de diretórios:"
+          find ${OLLAMA_DIR} -type d | sort
           
-          # Encontrar e copiar arquivos de modelo 
-          echo "📦 Copiando arquivos de modelo para diretório temporário..."
+          # Verificar arquivos grandes
+          echo "📄 Arquivos grandes (>10MB):"
+          find ${OLLAMA_DIR} -type f -size +10M | sort
           
-          # Arquivos binários (*.bin)
-          find /tmp/ollama-data -type f -name "*.bin" -exec cp -v {} /tmp/model-files/ \;
+          # Copiar arquivos relevantes
+          echo "📦 Copiando arquivos..."
           
-          # Arquivos GGUF (*.gguf)
-          find /tmp/ollama-data -type f -name "*.gguf" -exec cp -v {} /tmp/model-files/ \;
+          # Arquivos binários e de configuração
+          for EXT in "bin" "gguf" "json"; do
+            find ${OLLAMA_DIR} -name "*.${EXT}" -exec cp -v {} /tmp/model-files/ \;
+          done
           
-          # Arquivos JSON (*.json)
-          find /tmp/ollama-data -type f -name "*.json" -exec cp -v {} /tmp/model-files/ \;
+          # Copiar arquivos grandes (modelo principal)
+          find ${OLLAMA_DIR} -type f -size +10M -exec cp -v {} /tmp/model-files/ \;
           
-          # Arquivos de modelo (model.*)
-          find /tmp/ollama-data -type f -name "model.*" -exec cp -v {} /tmp/model-files/ \;
-          
-          # Copiar quaisquer arquivos grandes (maior que 10MB) 
-          find /tmp/ollama-data -type f -size +10M -exec cp -v {} /tmp/model-files/ \;
-          
-          # Verificar se há arquivos copiados
-          echo "📋 Verificando arquivos copiados:"
+          # Verificar conteúdo
+          echo "📋 Arquivos copiados:"
           ls -lah /tmp/model-files/
           
-          # Verificar tamanho total
-          TOTAL_SIZE=$(du -sh /tmp/model-files/ | cut -f1)
-          echo "📊 Tamanho total dos arquivos copiados: ${TOTAL_SIZE}"
-          
+          # Se não encontrar arquivos, tentar diretório de blobs
           if [ ! "$(ls -A /tmp/model-files/)" ]; then
-            echo "❌ Nenhum arquivo de modelo encontrado! Explorando mais diretórios..."
+            echo "⚠️ Nenhum arquivo encontrado. Tentando copiar diretórios de blobs..."
+            BLOBS_DIR=$(find ${OLLAMA_DIR} -path "*/blobs" -type d | head -n 1)
             
-            # Tentativa adicional: copiar pastas inteiras
-            MODEL_BLOBS_DIR=$(find /tmp/ollama-data -path "*/blobs" -type d | head -n 1)
-            if [ -n "$MODEL_BLOBS_DIR" ]; then
-              echo "📦 Copiando diretório de blobs: ${MODEL_BLOBS_DIR}"
-              cp -r ${MODEL_BLOBS_DIR}/* /tmp/model-files/
+            if [ -n "$BLOBS_DIR" ]; then
+              echo "Copiando blobs de: ${BLOBS_DIR}"
+              cp -rv ${BLOBS_DIR}/* /tmp/model-files/
             fi
             
             # Verificar novamente
-            echo "📋 Verificando arquivos após tentativa adicional:"
+            echo "📋 Arquivos após tentativa de blobs:"
             ls -lah /tmp/model-files/
-            
-            TOTAL_SIZE=$(du -sh /tmp/model-files/ | cut -f1)
-            echo "📊 Tamanho total dos arquivos copiados: ${TOTAL_SIZE}"
-            
-            if [ ! "$(ls -A /tmp/model-files/)" ]; then
-              echo "❌ Falha ao encontrar arquivos de modelo!"
-              exit 1
+          fi
+          
+          # Segunda alternativa - explorar /usr/local
+          if [ ! "$(ls -A /tmp/model-files/)" ]; then
+            echo "⚠️ Tentando localizar em /usr/local/share/ollama..."
+            if [ -d "/usr/local/share/ollama" ]; then
+              find /usr/local/share/ollama -type f -size +1M -exec cp -v {} /tmp/model-files/ \;
             fi
+            
+            echo "📋 Arquivos após tentativa alternativa:"
+            ls -lah /tmp/model-files/
+          fi
+          
+          # Verificar tamanho total
+          TOTAL_SIZE=$(du -sh /tmp/model-files/ | cut -f1)
+          echo "📊 Tamanho total dos arquivos: ${TOTAL_SIZE}"
+          
+          if [ ! "$(ls -A /tmp/model-files/)" ]; then
+            echo "❌ Não foi possível encontrar os arquivos do modelo!"
+            
+            # Exploração mais profunda
+            echo "🔎 Realizando busca em todo o sistema por arquivos de modelo..."
+            sudo find / -name "*.gguf" -o -name "*.bin" -size +100M 2>/dev/null | grep -v "proc\|sys" | head -n 10
+            
+            exit 1
           fi
           
           # Criar Dockerfile
@@ -136,21 +150,20 @@ jobs:
           COPY . /
           LABEL org.opencontainers.image.title="${MODEL_FULL}"
           LABEL org.opencontainers.image.description="Ollama model ${MODEL_FULL} synced via GitHub Actions"
-          LABEL org.opencontainers.image.source="https://github.com/ollama/ollama"
           CMD [""]
           EOF
           
-          # Construir imagem Docker
+          # Construir imagem
           echo "🏗️ Construindo imagem Docker..."
           cd /tmp/model-files/
           docker build -t ${TARGET} .
           
           # Verificar tamanho da imagem
           IMAGE_SIZE=$(docker image ls ${TARGET} --format "{{.Size}}")
-          echo "📊 Tamanho da imagem Docker: ${IMAGE_SIZE}"
+          echo "📊 Tamanho da imagem: ${IMAGE_SIZE}"
           
           if [[ "${IMAGE_SIZE}" == *"kB"* || "${IMAGE_SIZE}" == *"KB"* ]]; then
-            echo "⚠️ Aviso: A imagem parece ser muito pequena (${IMAGE_SIZE})!"
+            echo "⚠️ A imagem parece muito pequena (${IMAGE_SIZE})!"
             if [[ "${IMAGE_SIZE}" == "1.1kB" || "${IMAGE_SIZE}" == "1.1KB" ]]; then
               echo "❌ A imagem tem exatamente 1.1KB, o que indica que não há arquivos de modelo!"
               exit 1
@@ -169,7 +182,7 @@ jobs:
             echo "✅ Modelo publicado: ${TARGET}"
             echo ""
             echo "Para usar localmente:"
-            echo "1. Crie um arquivo Modelfile:"
+            echo "1. Crie um arquivo Modelfile com o conteúdo:"
             echo "FROM ${TARGET}"
             echo ""
             echo "2. Execute: ollama create modelo-local -f ./Modelfile"
