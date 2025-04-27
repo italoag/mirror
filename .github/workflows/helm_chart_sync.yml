@@ -49,7 +49,7 @@ jobs:
           
           # Montar URL de origem e destino
           SOURCE_URL="oci://registry-1.docker.io/${CHART_REPO}"
-          TARGET_URL="oci://ghcr.io/italoag/public/charts/${CHART_NAME}"
+          TARGET_URL="oci://ghcr.io/italoag/mirror/charts/${CHART_NAME}"
           echo "SOURCE_URL=${SOURCE_URL}" >> $GITHUB_ENV
           echo "TARGET_URL=${TARGET_URL}" >> $GITHUB_ENV
           
