@@ -32,7 +32,6 @@ jobs:
           FORCE="${{ github.event.inputs.force_resync }}"
           UPSTREAM="registry.ollama.ai/library/${MODEL_NAME}:${MODEL_TAG}"
           TARGET="ghcr.io/${{ github.repository_owner }}/public/${MODEL_NAME}:${MODEL_TAG}"
-
           echo "MODEL_NAME=${MODEL_NAME}"   >> $GITHUB_ENV
           echo "MODEL_TAG=${MODEL_TAG}"     >> $GITHUB_ENV
           echo "FORCE=${FORCE}"             >> $GITHUB_ENV
@@ -65,6 +64,8 @@ jobs:
       - name: Pull, Tag & Push (sem Content Trust)
         if: env.EXISTS == 'false'
         run: |
+          export DOCKER_CONTENT_TRUST=0
+
           echo "📥 Pull ${UPSTREAM}"
           docker pull --disable-content-trust "${UPSTREAM}"
 
