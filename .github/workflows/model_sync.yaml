@@ -66,12 +66,11 @@ jobs:
           mkdir -p /tmp/ollama-data
           mkdir -p /tmp/model-files
           
-          # Baixar modelo usando container Ollama com volume mapeado
+          # Executar container Docker com Ollama e baixar o modelo
           echo "📥 Baixando modelo ${MODEL_FULL}..."
           docker run --name ollama-downloader \
             -v /tmp/ollama-data:/root/.ollama \
-            ollama/ollama \
-            sh -c "ollama serve & sleep 5 && ollama pull ${MODEL_FULL} && sleep 2"
+            ollama/ollama bash -c "ollama serve & sleep 5 && ollama pull ${MODEL_FULL} && sleep 2"
           
           # Listar estrutura de diretórios para debug
           echo "🔍 Estrutura de diretórios de volume do Ollama:"
