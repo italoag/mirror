@@ -149,50 +149,30 @@ jobs:
           echo "📤 Enviando imagem para GHCR..."
           docker push ${TARGET}
           
-      - name: Check & Set Visibility
+      - name: Check & Set Visibility using GitHub CLI
         if: env.MAKE_PUBLIC == 'true'
         id: visibility
         run: |
           PACKAGE_NAME="${{ env.MODEL_NAME }}"
-          PACKAGE_TYPE="container" # Ajuste se necessário para outro tipo de pacote
-          OWNER="italoag"
+          PACKAGE_TYPE="container"
 
-          # GET current visibility
+          # Check current visibility using GitHub CLI
           echo "🔍 Verificando visibilidade atual do pacote ${PACKAGE_NAME}..."
-          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
-            "https://api.github.com/orgs/${OWNER}/packages/${PACKAGE_TYPE}/${PACKAGE_NAME}")
+          CURRENT_VIS=$(gh api "/user/packages/${PACKAGE_TYPE}/${PACKAGE_NAME}" --jq '.visibility')
 
-          if [[ "$RESPONSE" -ne 200 ]]; then
-            echo "❌ Falha ao obter a visibilidade do pacote. Código HTTP: $RESPONSE"
-            cat response.json
-            exit 1
-          fi
+          echo "VISIBILITY=${CURRENT_VIS}" >> $GITHUB_ENV
+          echo "🔍 Visibilidade atual: ${CURRENT_VIS}"
 
-          VIS=$(jq -r '.visibility' response.json)
-          echo "VISIBILITY=${VIS}" >> $GITHUB_ENV
-          echo "🔍 Visibilidade atual: ${VIS}"
-
-          # If not public, PATCH to set it public
-          if [[ "$VIS" != "public" ]]; then
+          # If not public, set the visibility to public
+          if [[ "$CURRENT_VIS" != "public" ]]; then
             echo "🔓 Tornando público o pacote ${PACKAGE_NAME}..."
-            RESPONSE=$(curl -s -o response.json -w "%{http_code}" -X PATCH \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
-              "https://api.github.com/orgs/${OWNER}/packages/${PACKAGE_TYPE}/${PACKAGE_NAME}" \
-              -d '{"visibility":"public"}')
-
-            if [[ "$RESPONSE" -ne 200 && "$RESPONSE" -ne 202 ]]; then
-              echo "❌ Falha ao alterar a visibilidade do pacote. Código HTTP: $RESPONSE"
-              cat response.json
-              exit 1
-            fi
-
+            gh api -X PATCH "/user/packages/${PACKAGE_TYPE}/${PACKAGE_NAME}" -F visibility=public
             echo "✅ O pacote agora é público."
           else
             echo "ℹ️ O pacote já estava público."
-          fi      
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
       
       - name: Result
         run: |
