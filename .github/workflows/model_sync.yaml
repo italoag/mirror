@@ -1,3 +1,4 @@
+# .github/workflows/sync-ollama-model-to-ghcr.yml
 name: Sync Ollama Model to GHCR
 
 on:
@@ -18,6 +19,8 @@ on:
 jobs:
   sync-model:
     runs-on: ubuntu-latest
+    env:
+      DOCKER_CONTENT_TRUST: "0"    # ⬅️ desativa verificações de assinatura
     permissions:
       contents: read
       packages: write
@@ -38,7 +41,7 @@ jobs:
           echo "UPSTREAM=${UPSTREAM}"       >> $GITHUB_ENV
           echo "TARGET=${TARGET}"           >> $GITHUB_ENV
 
-      - name: Login GHCR
+      - name: Login no GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -50,26 +53,34 @@ jobs:
         continue-on-error: true
         run: |
           if [[ "${FORCE}" != "true" ]]; then
-            docker manifest inspect "${TARGET}" >/dev/null 2>&1 \
-              && echo "EXISTS=true" >> $GITHUB_ENV \
-              && echo "Pulando: já existe em ${TARGET}" \
-              || echo "EXISTS=false" >> $GITHUB_ENV
+            if docker manifest inspect "${TARGET}" >/dev/null 2>&1; then
+              echo "EXISTS=true" >> $GITHUB_ENV
+              echo "✅ Já existe: ${TARGET}"
+            else
+              echo "EXISTS=false" >> $GITHUB_ENV
+            fi
           else
             echo "EXISTS=false" >> $GITHUB_ENV
+            echo "🔄 Forçando ressincronização"
           fi
 
       - name: Pull, Tag & Push
         if: env.EXISTS == 'false'
         run: |
+          echo "📥 Pull ${UPSTREAM}"
           docker pull "${UPSTREAM}"
-          docker tag  "${UPSTREAM}" "${TARGET}"
+          
+          echo "🏷️  Tag ${TARGET}"
+          docker tag "${UPSTREAM}" "${TARGET}"
+          
+          echo "📤 Push ${TARGET}"
           docker push "${TARGET}"
 
       - name: Resultado
         run: |
           if [[ "${EXISTS}" == "true" ]]; then
-            echo "✅ Nada para fazer: ${TARGET} já existe."
+            echo "ℹ️  Nenhuma ação: imagem já existe em GHCR."
           else
-            echo "✅ Publicado: ${TARGET}"
-            echo "Use: ollama pull ${TARGET}"
+            echo "✅ Modelo publicado: ${TARGET}"
+            echo "   Use internamente: ollama pull ${TARGET}"
           fi
