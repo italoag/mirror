@@ -1,0 +1,124 @@
+# .github/workflows/sync-hf-model-to-ghcr.yml
+name: Sync HF Model to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_repo:
+        description: 'Repositório HF (ex: deepseek-ai/DeepSeek-R1)'
+        required: true
+      file_pattern:
+        description: 'Padrão glob do arquivo de modelo (ex: "*.gguf")'
+        required: false
+        default: '*.gguf'
+      force_resync:
+        description: 'Forçar ressincronização mesmo que já exista'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  sync-model:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 1) Instalar Git LFS
+      - name: Setup Git LFS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+          git lfs install                                         
+
+      # 2) Definir variáveis de ambiente
+      - name: Set Variables
+        id: vars
+        run: |
+          MODEL_REPO="${{ github.event.inputs.model_repo }}"
+          FILE_PATTERN="${{ github.event.inputs.file_pattern }}"
+          FORCE="${{ github.event.inputs.force_resync }}"
+          REPO_NAME=$(echo "${MODEL_REPO}" | awk -F'/' '{print $NF}')
+          MODEL_NAME=$(echo "${REPO_NAME}" | tr '[:upper:]' '[:lower:]')
+          HF_CLONE_URL="https://huggingface.co/${MODEL_REPO}"
+
+          echo "MODEL_REPO=${MODEL_REPO}"    >> $GITHUB_ENV
+          echo "FILE_PATTERN=${FILE_PATTERN}">> $GITHUB_ENV
+          echo "FORCE=${FORCE}"              >> $GITHUB_ENV
+          echo "MODEL_NAME=${MODEL_NAME}"    >> $GITHUB_ENV
+          echo "HF_CLONE_URL=${HF_CLONE_URL}">> $GITHUB_ENV
+
+      # 3) Clonar repo HF e baixar via LFS
+      - name: Clone Hugging Face Repo
+        run: |
+          git clone "${HF_CLONE_URL}" hf-model                    # :contentReference[oaicite:0]{index=0}
+          cd hf-model
+          git lfs pull --include="${FILE_PATTERN}"
+          cd ..
+
+      # 4) Determinar arquivo e tag
+      - name: Determine Tag & Target Image
+        id: image
+        run: |
+          cd hf-model
+          FILES=($(ls ${FILE_PATTERN}))
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "Nenhum arquivo encontrado com padrão ${FILE_PATTERN}" >&2
+            exit 1
+          fi
+          FILE="${FILES[0]}"
+          TAG=$(basename "${FILE}" .gguf)
+          echo "FILE=${FILE}"            >> $GITHUB_ENV
+          echo "TAG=${TAG}"              >> $GITHUB_ENV
+          TARGET_IMAGE="ghcr.io/${{ github.repository_owner }}/public/${MODEL_NAME}:${TAG}"
+          echo "TARGET_IMAGE=${TARGET_IMAGE}" >> $GITHUB_ENV
+          cd ..
+
+      # 5) Login no GHCR
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # 6) Verificar existência da imagem
+      - name: Check if Image Exists
+        id: check
+        continue-on-error: true
+        run: |
+          if [[ "${FORCE}" != "true" ]]; then
+            if docker manifest inspect "${TARGET_IMAGE}" >/dev/null 2>&1; then
+              echo "EXISTS=true" >> $GITHUB_ENV
+              echo "Imagem já existe em ${TARGET_IMAGE}, pulando build."
+            else
+              echo "EXISTS=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "EXISTS=false" >> $GITHUB_ENV
+            echo "Forçando ressincronização."
+          fi
+
+      # 7) Build & Push (se necessário)
+      - name: Build & Push Model Image
+        if: env.EXISTS == 'false'
+        run: |
+          cat > Dockerfile <<EOF
+          FROM ollama/ollama:latest
+          RUN mkdir -p /root/.ollama/models/library/${MODEL_NAME}/${TAG}
+          COPY hf-model/${FILE} /root/.ollama/models/library/${MODEL_NAME}/${TAG}/${FILE}
+          EOF
+
+          docker build -t "${TARGET_IMAGE}" .
+          docker push "${TARGET_IMAGE}"                              # :contentReference[oaicite:1]{index=1}
+
+      # 8) Resultado
+      - name: Result
+        run: |
+          if [[ "${EXISTS}" == "true" ]]; then
+            echo "✅ Modelo já existia em GHCR. Nenhuma ação adicional."
+          else
+            echo "✅ Modelo '${MODEL_NAME}:${TAG}' publicado em ${TARGET_IMAGE}"
+            echo "Para usar: ollama pull ${TARGET_IMAGE}"
+          fi
