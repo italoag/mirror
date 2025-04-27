@@ -26,13 +26,13 @@ jobs:
           MODEL_NAME="${{ github.event.inputs.model_name }}"
           MODEL_TAG="${{ github.event.inputs.model_tag }}"
           FORCE="${{ github.event.inputs.force_resync }}"
-          UPSTREAM="registry.ollama.ai/library/${MODEL_NAME}:${MODEL_TAG}"
+          MODEL_FULL="${MODEL_NAME}:${MODEL_TAG}"
           TARGET="ghcr.io/${{ github.repository_owner }}/public/${MODEL_NAME}:${MODEL_TAG}"
-          echo "MODEL_NAME=${MODEL_NAME}"   >> $GITHUB_ENV
-          echo "MODEL_TAG=${MODEL_TAG}"     >> $GITHUB_ENV
-          echo "FORCE=${FORCE}"             >> $GITHUB_ENV
-          echo "UPSTREAM=${UPSTREAM}"       >> $GITHUB_ENV
-          echo "TARGET=${TARGET}"           >> $GITHUB_ENV
+          echo "MODEL_NAME=${MODEL_NAME}" >> $GITHUB_ENV
+          echo "MODEL_TAG=${MODEL_TAG}" >> $GITHUB_ENV
+          echo "MODEL_FULL=${MODEL_FULL}" >> $GITHUB_ENV
+          echo "FORCE=${FORCE}" >> $GITHUB_ENV
+          echo "TARGET=${TARGET}" >> $GITHUB_ENV
       
       - name: Login no GHCR
         uses: docker/login-action@v3
@@ -57,71 +57,61 @@ jobs:
             echo "🔄 Forçando ressincronização"
           fi
       
-      # Tentativa 1: Desabilitar Content Trust no comando específico
-      - name: Tentativa 1 - Pull com flag --disable-content-trust
+      - name: Instalar Ollama
         if: env.EXISTS == 'false'
-        id: attempt1
-        continue-on-error: true
         run: |
-          echo "📥 Pull ${UPSTREAM}"
-          docker pull --disable-content-trust "${UPSTREAM}"
-          echo "ATTEMPT1_SUCCESS=true" >> $GITHUB_ENV
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
       
-      # Tentativa 2: Instalar e usar Skopeo
-      - name: Instalar Skopeo
-        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true'
+      - name: Baixar Modelo Ollama e Criar Imagem Docker
+        if: env.EXISTS == 'false'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y skopeo
-      
-      - name: Tentativa 2 - Skopeo Copy
-        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true'
-        id: attempt2
-        continue-on-error: true
-        run: |
-          echo "🔄 Copiando com Skopeo ${UPSTREAM} para ${TARGET}"
-          skopeo copy --all docker://${UPSTREAM} docker://${TARGET}
-          echo "ATTEMPT2_SUCCESS=true" >> $GITHUB_ENV
-      
-      # Tentativa 3: Usar Crane
-      - name: Instalar Crane
-        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true' && env.ATTEMPT2_SUCCESS != 'true'
-        run: |
-          go install github.com/google/go-containerregistry/cmd/crane@latest
-          export PATH=$PATH:$(go env GOPATH)/bin
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      
-      - name: Tentativa 3 - Crane Copy
-        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true' && env.ATTEMPT2_SUCCESS != 'true'
-        id: attempt3
-        continue-on-error: true
-        run: |
-          echo "🔄 Copiando com Crane ${UPSTREAM} para ${TARGET}"
-          crane copy "${UPSTREAM}" "${TARGET}"
-          echo "ATTEMPT3_SUCCESS=true" >> $GITHUB_ENV
-      
-      # Continuação do fluxo se a tentativa 1 foi bem-sucedida
-      - name: Tag & Push após Pull bem-sucedido
-        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS == 'true'
-        run: |
-          echo "🏷️ Tag ${TARGET}"
-          docker tag "${UPSTREAM}" "${TARGET}"
+          echo "📥 Pull do modelo ${MODEL_FULL} via Ollama"
+          # Iniciar o serviço Ollama em background
+          ollama serve &
           
-          echo "📤 Push ${TARGET}"
-          docker push --disable-content-trust "${TARGET}"
+          # Aguardar inicialização do serviço
+          sleep 5
+          
+          # Baixar o modelo
+          ollama pull ${MODEL_FULL}
+          
+          # Encontrar onde o Ollama armazena os modelos
+          OLLAMA_MODELS_DIR=~/.ollama/models
+          
+          # Encontrar o diretório específico do modelo (pode variar dependendo da versão do Ollama)
+          MODEL_DIR=$(find ${OLLAMA_MODELS_DIR} -type d -name "${MODEL_NAME}*${MODEL_TAG}*" | head -n 1)
+          
+          if [ -z "$MODEL_DIR" ]; then
+            echo "❌ Não foi possível encontrar o diretório do modelo"
+            ls -la ${OLLAMA_MODELS_DIR}
+            exit 1
+          fi
+          
+          echo "📦 Modelo encontrado em: ${MODEL_DIR}"
+          
+          # Criar diretório temporário para o modelo
+          TEMP_DIR=$(mktemp -d)
+          cp -r ${MODEL_DIR}/* ${TEMP_DIR}/
+          
+          # Criar Dockerfile
+          cat > ${TEMP_DIR}/Dockerfile << EOF
+          FROM scratch
+          COPY . /
+          LABEL org.opencontainers.image.description="Ollama model ${MODEL_FULL}"
+          CMD [""]
+          EOF
+          
+          # Construir e enviar imagem
+          cd ${TEMP_DIR}
+          docker build -t ${TARGET} .
+          docker push ${TARGET}
       
-      # Verificação final
-      - name: Verificar resultado final
-        if: always()
+      - name: Resultado
         run: |
           if [[ "${EXISTS}" == "true" ]]; then
             echo "ℹ️ Nenhuma ação: imagem já existia em GHCR."
-            exit 0
-          elif [[ "${ATTEMPT1_SUCCESS}" == "true" || "${ATTEMPT2_SUCCESS}" == "true" || "${ATTEMPT3_SUCCESS}" == "true" ]]; then
+          else
             echo "✅ Modelo publicado: ${TARGET}"
             echo "   Para usar: ollama pull ${TARGET}"
-            exit 0
-          else
-            echo "❌ Todas as tentativas falharam."
-            exit 1
           fi
