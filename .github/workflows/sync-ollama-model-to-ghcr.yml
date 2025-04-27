@@ -1,0 +1,150 @@
+# .github/workflows/sync-ollama-model-to-ghcr.yml
+name: Sync Ollama Model to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Nome do modelo (ex: deepseek-r1)'
+        required: true
+      model_tag:
+        description: 'Tag do modelo (ex: 7b, 671b)'
+        required: true
+      force_resync:
+        description: 'Forçar ressincronização mesmo se já existir'
+        required: false
+        type: boolean
+        default: false
+      make_public:
+        description: 'Definir visibilidade pública após push?'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  sync-model:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set Variables
+        id: vars
+        run: |
+          MODEL_NAME="${{ github.event.inputs.model_name }}"
+          MODEL_TAG="${{ github.event.inputs.model_tag }}"
+          FORCE="${{ github.event.inputs.force_resync }}"
+          MAKE_PUBLIC="${{ github.event.inputs.make_public }}"
+          MODEL_FULL="${MODEL_NAME}:${MODEL_TAG}"
+          UPSTREAM="registry.ollama.ai/library/${MODEL_FULL}"
+          TARGET="ghcr.io/${{ github.repository_owner }}/public/${MODEL_FULL}"
+
+          echo "MODEL_NAME=${MODEL_NAME}"   >> $GITHUB_ENV
+          echo "MODEL_TAG=${MODEL_TAG}"     >> $GITHUB_ENV
+          echo "MODEL_FULL=${MODEL_FULL}"   >> $GITHUB_ENV
+          echo "FORCE=${FORCE}"             >> $GITHUB_ENV
+          echo "MAKE_PUBLIC=${MAKE_PUBLIC}" >> $GITHUB_ENV
+          echo "UPSTREAM=${UPSTREAM}"       >> $GITHUB_ENV
+          echo "TARGET=${TARGET}"           >> $GITHUB_ENV
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl python3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Check if Image Exists
+        id: check
+        continue-on-error: true
+        run: |
+          EXISTS="false"
+          if [[ "${FORCE}" != "true" ]]; then
+            if docker manifest inspect "${TARGET}" >/dev/null 2>&1; then
+              EXISTS="true"
+              echo "✅ Já existe: ${TARGET}"
+            fi
+          fi
+          echo "EXISTS=${EXISTS}" >> $GITHUB_ENV
+
+      - name: Download & Build & Push via Ollama API (no Trust)
+        if: env.EXISTS == 'false'
+        run: |
+          export DOCKER_CONTENT_TRUST=0
+
+          echo "🔄 Baixando modelo ${MODEL_FULL} via API..."
+          REG_URL="https://registry.ollama.ai/v2/library/${MODEL_NAME}/manifests/${MODEL_TAG}"
+          curl -sL "$REG_URL" > manifest.json
+
+          echo "🔍 Extraindo layers..."
+          jq -r '.layers[].digest' manifest.json > layers.txt
+          mkdir model-files
+          while read layer; do
+            DIG="${layer#sha256:}"
+            curl -sL "https://registry.ollama.ai/v2/library/${MODEL_NAME}/blobs/${layer}" \
+              > "model-files/${DIG}"
+            TYPE=$(jq -r --arg d "$layer" '.layers[]|select(.digest==$d)|.mediaType' manifest.json)
+            if [[ "$TYPE" == *".model" ]]; then
+              mv "model-files/${DIG}" "model-files/model.bin"
+            fi
+          done < layers.txt
+
+          cat > model-files/Dockerfile <<EOF
+          FROM scratch
+          COPY . /
+          LABEL org.opencontainers.image.title="${MODEL_FULL}"
+          CMD [""]
+          EOF
+
+          cd model-files
+          docker build --disable-content-trust -t "${TARGET}" .
+          docker push --disable-content-trust "${TARGET}"
+
+      - name: Check & Set Visibility
+        if: env.MAKE_PUBLIC == 'true'
+        id: visibility
+        run: |
+          PACKAGE_PATH="public/${{ env.MODEL_NAME }}"
+          ENC_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${PACKAGE_PATH}', safe=''))")
+
+          # GET current visibility
+          VIS=$(curl -s \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
+            "https://api.github.com/user/packages/container/${ENC_PATH}/visibility" \
+            | jq -r .visibility)
+
+          echo "VISIBILITY=${VIS}" >> $GITHUB_ENV
+          echo "🔍 Visibilidade atual: ${VIS}"
+
+          # If not public, PATCH to public
+          if [[ "$VIS" != "public" ]]; then
+            echo "🔓 Tornando público..."
+            curl -s -X PATCH \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
+              "https://api.github.com/user/packages/container/${ENC_PATH}/visibility" \
+              -d '{"visibility":"public"}'
+            echo "✅ Agora público."
+          else
+            echo "ℹ️  Já estava público."
+          fi
+
+      - name: Result
+        run: |
+          if [[ "${EXISTS}" == "true" ]]; then
+            echo "ℹ️  Imagem já existia: ${TARGET}"
+          else
+            echo "✅  Modelo publicado: ${TARGET}"
+          fi
+          if [[ "${MAKE_PUBLIC}" == "true" ]]; then
+            echo "🔔 Visibilidade final: ${VISIBILITY}"
+          else
+            echo "🔔 Visibilidade mantida como privada."
+          fi
