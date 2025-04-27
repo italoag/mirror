@@ -1,4 +1,4 @@
-name: Sync Ollama Model to GHCR
+name: Sync Ollama Model to GHCR (API Direct)
 on:
   workflow_dispatch:
     inputs:
@@ -34,6 +34,11 @@ jobs:
           echo "FORCE=${FORCE}" >> $GITHUB_ENV
           echo "TARGET=${TARGET}" >> $GITHUB_ENV
       
+      - name: Instalar Dependências
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+      
       - name: Login no GHCR
         uses: docker/login-action@v3
         with:
@@ -54,119 +59,77 @@ jobs:
           fi
           echo "EXISTS=${IMAGE_EXISTS}" >> $GITHUB_ENV
       
-      - name: Instalar Dependências
+      - name: Download direto da API do Ollama Registry
         if: env.EXISTS == 'false'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
+          echo "🔄 Sincronizando modelo ${MODEL_FULL} diretamente da API..."
           
-          # Instalar Ollama
-          curl -fsSL https://ollama.com/install.sh | sh
-      
-      - name: Exportar e Sincronizar Modelo
-        if: env.EXISTS == 'false'
-        run: |
-          echo "🔄 Exportando modelo ${MODEL_FULL}..."
+          # Preparar diretórios
+          mkdir -p /tmp/ollama-api/model-files
+          cd /tmp/ollama-api
           
-          # Definir variáveis
-          OLLAMA_HOME="$HOME/.ollama"
-          BLOBS_PATH="$OLLAMA_HOME/models/blobs"
-          MANIFESTS_PATH="$OLLAMA_HOME/models/manifests"
-          EXPORT_DIR="/tmp/ollama-export-${MODEL_NAME}-${MODEL_TAG}"
-          REGISTRY="registry.ollama.ai"
-          LIBRARY="library"
+          # Obter o manifesto do modelo
+          REGISTRY_URL="https://registry.ollama.ai/v2/library/${MODEL_NAME}/manifests/${MODEL_TAG}"
+          echo "📥 Baixando manifesto de: ${REGISTRY_URL}"
           
-          # Criar diretório de exportação
-          mkdir -p "${EXPORT_DIR}"
+          curl -s "${REGISTRY_URL}" > manifest.json
           
-          # Iniciar serviço Ollama
-          ollama serve &
-          sleep 5
-          
-          # Baixar o modelo
-          echo "📥 Baixando modelo ${MODEL_FULL}..."
-          ollama pull ${MODEL_FULL}
-          sleep 2
-          
-          # Verificar se o manifesto existe
-          MANIFEST_FILE="${MANIFESTS_PATH}/${REGISTRY}/${LIBRARY}/${MODEL_NAME}/${MODEL_TAG}"
-          if [ ! -f "${MANIFEST_FILE}" ]; then
-            echo "❌ Manifesto não encontrado: ${MANIFEST_FILE}"
-            
-            # Listar diretórios para depuração
-            echo "📂 Estrutura de diretórios:"
-            find "${OLLAMA_HOME}" -type d | sort
-            
-            echo "📄 Manifestos encontrados:"
-            find "${MANIFESTS_PATH}" -type f | sort
-            
+          if [ ! -s manifest.json ]; then
+            echo "❌ Falha ao baixar o manifesto!"
             exit 1
           fi
           
-          echo "✅ Manifesto encontrado: ${MANIFEST_FILE}"
+          echo "✅ Manifesto baixado com sucesso"
+          cat manifest.json | jq
           
-          # Criar Modelfile inicial
-          echo "FROM ./model.bin" > "${EXPORT_DIR}/Modelfile"
+          # Extrair layers do manifesto
+          echo "🔍 Extraindo informações de layers..."
+          jq -r '.layers[].digest' manifest.json > layers.txt
           
-          # Processar as camadas do manifesto
-          echo "🔍 Processando camadas do manifesto..."
-          jq -r '.layers[].digest' "${MANIFEST_FILE}" | while read layer; do
-            BLOB_FILE="${BLOBS_PATH}/${layer//:/-}"
-            BLOB_TYPE=$(jq -r --arg layer "$layer" '.layers[] | select(.digest == $layer) | .mediaType' "${MANIFEST_FILE}" | sed 's|.*\.ollama\.image\.\(.*\)|\1|')
+          # Baixar cada layer
+          mkdir -p model-files
+          cat layers.txt | while read layer; do
+            layer_file=$(echo $layer | sed 's/sha256://g')
+            echo "📥 Baixando layer: ${layer}"
+            curl -sL "https://registry.ollama.ai/v2/library/${MODEL_NAME}/blobs/${layer}" > "model-files/${layer_file}"
             
-            echo "Processando: ${layer} (tipo: ${BLOB_TYPE})"
+            # Verificar o tipo de layer baseado no manifesto
+            layer_type=$(jq -r --arg layer "${layer}" '.layers[] | select(.digest == $layer) | .mediaType' manifest.json | sed 's|.*\.ollama\.image\.\(.*\)|\1|')
+            echo "   Tipo: ${layer_type}"
             
-            case "${BLOB_TYPE}" in
-              model)
-                echo "📦 Copiando arquivo do modelo..."
-                cp "${BLOB_FILE}" "${EXPORT_DIR}/model.bin"
-                ;;
-              params)
-                echo "⚙️ Processando parâmetros..."
-                PARAMS_JSON=$(cat "${BLOB_FILE}")
-                echo "${PARAMS_JSON}" | jq -r 'keys[] as $key | .[$key][] | "PARAMETER \($key) \"\(.)\""' >> "${EXPORT_DIR}/Modelfile"
-                ;;
-              *)
-                TYPE_NAME=$(echo "${BLOB_TYPE}" | tr '[:lower:]' '[:upper:]')
-                FILE_CONTENT=$(cat "${BLOB_FILE}")
-                echo "${TYPE_NAME} \"\"\"${FILE_CONTENT}\"\"\"" >> "${EXPORT_DIR}/Modelfile"
-                ;;
-            esac
+            # Se for o arquivo de modelo, renomeie-o
+            if [[ "${layer_type}" == "model" ]]; then
+              echo "✅ Encontrado arquivo principal do modelo: ${layer_file}"
+              mv "model-files/${layer_file}" "model-files/model.bin"
+            fi
           done
           
-          # Verificar os arquivos exportados
-          echo "📋 Arquivos exportados:"
-          ls -lah "${EXPORT_DIR}"
+          # Verificar os arquivos baixados
+          echo "📋 Arquivos baixados:"
+          ls -lah model-files/
           
-          # Verificar tamanho do arquivo de modelo
-          if [ -f "${EXPORT_DIR}/model.bin" ]; then
-            MODEL_SIZE=$(du -sh "${EXPORT_DIR}/model.bin" | cut -f1)
-            echo "📊 Tamanho do arquivo de modelo: ${MODEL_SIZE}"
-          else
-            echo "❌ Arquivo de modelo não encontrado!"
-            exit 1
-          fi
+          # Verificar tamanho total
+          TOTAL_SIZE=$(du -sh model-files/ | cut -f1)
+          echo "📊 Tamanho total dos arquivos: ${TOTAL_SIZE}"
           
           # Criar Dockerfile
-          cat > "${EXPORT_DIR}/Dockerfile" << EOF
+          cat > model-files/Dockerfile << EOF
           FROM scratch
           COPY . /
           LABEL org.opencontainers.image.title="${MODEL_FULL}"
           LABEL org.opencontainers.image.description="Ollama model ${MODEL_FULL} synced via GitHub Actions"
-          LABEL org.opencontainers.image.visibility="public"
           CMD [""]
           EOF
           
           # Construir imagem Docker
           echo "🏗️ Construindo imagem Docker..."
-          cd "${EXPORT_DIR}"
-          docker build -t "${TARGET}" .
+          cd model-files/
+          docker build -t ${TARGET} .
           
           # Verificar tamanho da imagem
-          IMAGE_SIZE=$(docker image ls "${TARGET}" --format "{{.Size}}")
+          IMAGE_SIZE=$(docker image ls ${TARGET} --format "{{.Size}}")
           echo "📊 Tamanho da imagem Docker: ${IMAGE_SIZE}"
           
-          # Verificar se a imagem tem tamanho razoável
           if [[ "${IMAGE_SIZE}" == *"kB"* || "${IMAGE_SIZE}" == *"KB"* ]]; then
             KB_SIZE=$(echo "${IMAGE_SIZE}" | sed 's/[^0-9]//g')
             if [[ $KB_SIZE -lt 1000 ]]; then
@@ -175,34 +138,27 @@ jobs:
             fi
           fi
           
-          # Definir visibilidade pública da imagem
-          echo "🔓 Configurando visibilidade pública..."
-          
           # Enviar imagem para GHCR
           echo "📤 Enviando imagem para GHCR..."
-          docker push "${TARGET}"
+          docker push ${TARGET}
           
-          # Tornar o pacote público via API
-          REPO_NAME="${{ github.repository_owner }}/${MODEL_NAME}"
-          echo "🔓 Tornando o pacote público via API GitHub..."
+          # Tornar o pacote público via GitHub API
+          echo "🔓 Configurando visibilidade pública do pacote..."
+          PACKAGE_NAME=$(echo "${MODEL_NAME}" | tr '[:upper:]' '[:lower:]')
           
           curl -X PATCH \
             -H "Authorization: token ${{ secrets.GHCR_PAT }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/orgs/${{ github.repository_owner }}/packages/container/${MODEL_NAME}/versions" \
+            "https://api.github.com/user/packages/container/${PACKAGE_NAME}/visibility" \
             -d '{"visibility":"public"}'
       
       - name: Resultado
         run: |
-          if [[ "${EXISTS}" == "true" && "${FORCE}" != "true" ]]; then
+          if [[ "${EXISTS}" == "true" ]]; then
             echo "ℹ️ Nenhuma ação: imagem já existia em GHCR."
           else
             echo "✅ Modelo publicado: ${TARGET}"
             echo ""
             echo "Para usar localmente:"
-            echo "1. Crie um arquivo Modelfile com o conteúdo:"
-            echo "FROM ${TARGET}"
-            echo ""
-            echo "2. Execute: ollama create modelo-local -f ./Modelfile"
-            echo "3. Use: ollama run modelo-local"
+            echo "ollama pull ${TARGET}"
           fi
