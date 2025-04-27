@@ -71,7 +71,7 @@ jobs:
           TAG=$(basename "${FILE}" .gguf)
           echo "FILE=${FILE}"            >> $GITHUB_ENV
           echo "TAG=${TAG}"              >> $GITHUB_ENV
-          TARGET_IMAGE="ghcr.io/${{ github.repository_owner }}/public/${MODEL_NAME}:${TAG}"
+          TARGET_IMAGE="ghcr.io/${{ github.repository_owner }}/mirror/${MODEL_NAME}:${TAG}"
           echo "TARGET_IMAGE=${TARGET_IMAGE}" >> $GITHUB_ENV
           cd ..
 
