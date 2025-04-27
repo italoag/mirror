@@ -61,7 +61,7 @@ jobs:
           echo "FORCE_RESYNC=${FORCE_RESYNC}" >> $GITHUB_ENV
           
           # Para GHCR, mantemos o formato completo
-          GHCR_IMAGE="ghcr.io/italoag/public/${IMAGE_NAME}:${IMAGE_TAG}"
+          GHCR_IMAGE="ghcr.io/italoag/mirror/${IMAGE_NAME}:${IMAGE_TAG}"
           echo "GHCR_IMAGE=${GHCR_IMAGE}" >> $GITHUB_ENV
           
           # Log para depuração
@@ -76,10 +76,10 @@ jobs:
           # Extrair caminho da imagem para o GHCR
           if [[ "${{ env.IMAGE_NAME }}" == *"/"* ]]; then
             # Imagem com namespace (ex: ethereum/client-go)
-            GHCR_PATH="italoag/public/${{ env.IMAGE_NAME }}"
+            GHCR_PATH="italoag/mirror/${{ env.IMAGE_NAME }}"
           else
             # Imagem simples (ex: postgres)
-            GHCR_PATH="italoag/public/${{ env.IMAGE_NAME }}"
+            GHCR_PATH="italoag/mirror/${{ env.IMAGE_NAME }}"
           fi
           
           # Verificação HTTP para o manifesto da imagem no GHCR
