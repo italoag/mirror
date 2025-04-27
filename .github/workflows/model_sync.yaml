@@ -165,9 +165,7 @@ jobs:
 
           # If not public, set the visibility to public
           if [[ "$CURRENT_VIS" != "public" ]]; then
-            echo "🔓 Tornando público o pacote ${PACKAGE_NAME}..."
-            gh api -X PATCH "/user/packages/${PACKAGE_TYPE}/${PACKAGE_NAME}" -F visibility=public
-            echo "✅ O pacote agora é público."
+            echo "🔓 Você precisa tormar o pacote ${PACKAGE_NAME} publico manualmente API não disponível"
           else
             echo "ℹ️ O pacote já estava público."
           fi
