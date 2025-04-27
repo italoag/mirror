@@ -1,5 +1,5 @@
 # .github/workflows/sync-ollama-model-to-ghcr.yml
-name: Sync Model to GHCR
+name: Sync Ollama Model to GHCR
 
 on:
   workflow_dispatch:
@@ -19,8 +19,6 @@ on:
 jobs:
   sync-model:
     runs-on: ubuntu-latest
-    env:
-      DOCKER_CONTENT_TRUST: "0"    # ⬅️ desativa verificações de assinatura
     permissions:
       contents: read
       packages: write
@@ -34,7 +32,7 @@ jobs:
           FORCE="${{ github.event.inputs.force_resync }}"
           UPSTREAM="registry.ollama.ai/library/${MODEL_NAME}:${MODEL_TAG}"
           TARGET="ghcr.io/${{ github.repository_owner }}/public/${MODEL_NAME}:${MODEL_TAG}"
-          
+
           echo "MODEL_NAME=${MODEL_NAME}"   >> $GITHUB_ENV
           echo "MODEL_TAG=${MODEL_TAG}"     >> $GITHUB_ENV
           echo "FORCE=${FORCE}"             >> $GITHUB_ENV
@@ -64,23 +62,23 @@ jobs:
             echo "🔄 Forçando ressincronização"
           fi
 
-      - name: Pull, Tag & Push
+      - name: Pull, Tag & Push (sem Content Trust)
         if: env.EXISTS == 'false'
         run: |
           echo "📥 Pull ${UPSTREAM}"
-          docker pull "${UPSTREAM}"
-          
+          docker pull --disable-content-trust "${UPSTREAM}"
+
           echo "🏷️  Tag ${TARGET}"
           docker tag "${UPSTREAM}" "${TARGET}"
-          
+
           echo "📤 Push ${TARGET}"
-          docker push "${TARGET}"
+          docker push --disable-content-trust "${TARGET}"
 
       - name: Resultado
         run: |
           if [[ "${EXISTS}" == "true" ]]; then
-            echo "ℹ️  Nenhuma ação: imagem já existe em GHCR."
+            echo "ℹ️  Nenhuma ação: imagem já existia em GHCR."
           else
             echo "✅ Modelo publicado: ${TARGET}"
-            echo "   Use internamente: ollama pull ${TARGET}"
+            echo "   Para usar: ollama pull ${TARGET}"
           fi
