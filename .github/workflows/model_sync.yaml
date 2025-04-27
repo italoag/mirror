@@ -1,5 +1,5 @@
 # .github/workflows/sync-ollama-model-to-ghcr.yml
-name: Sync Ollama Model to GHCR
+name: Sync Model to GHCR
 
 on:
   workflow_dispatch:
