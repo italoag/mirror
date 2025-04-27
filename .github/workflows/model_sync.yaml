@@ -1,4 +1,4 @@
-name: Sync Ollama Model to GHCR (API Direct)
+name: Sync Ollama Model to GHCR
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +10,11 @@ on:
         required: true
       force_resync:
         description: 'Forçar ressincronização mesmo se já existir'
+        required: false
+        type: boolean
+        default: false
+      make_public:
+        description: 'Definir visibilidade pública após push?'
         required: false
         type: boolean
         default: false
@@ -26,10 +31,12 @@ jobs:
           MODEL_NAME="${{ github.event.inputs.model_name }}"
           MODEL_TAG="${{ github.event.inputs.model_tag }}"
           FORCE="${{ github.event.inputs.force_resync }}"
+          MAKE_PUBLIC="${{ github.event.inputs.make_public }}"
           MODEL_FULL="${MODEL_NAME}:${MODEL_TAG}"
           TARGET="ghcr.io/${{ github.repository_owner }}/${MODEL_NAME}:${MODEL_TAG}"
           echo "MODEL_NAME=${MODEL_NAME}" >> $GITHUB_ENV
           echo "MODEL_TAG=${MODEL_TAG}" >> $GITHUB_ENV
+          echo "MAKE_PUBLIC=${MAKE_PUBLIC}" >> $GITHUB_ENV
           echo "MODEL_FULL=${MODEL_FULL}" >> $GITHUB_ENV
           echo "FORCE=${FORCE}" >> $GITHUB_ENV
           echo "TARGET=${TARGET}" >> $GITHUB_ENV
@@ -142,23 +149,45 @@ jobs:
           echo "📤 Enviando imagem para GHCR..."
           docker push ${TARGET}
           
-          # Tornar o pacote público via GitHub API
-          echo "🔓 Configurando visibilidade pública do pacote..."
-          PACKAGE_NAME=$(echo "${MODEL_NAME}" | tr '[:upper:]' '[:lower:]')
-          
-          curl -X PATCH \
-            -H "Authorization: token ${{ secrets.GHCR_PAT }}" \
+      - name: Check & Set Visibility
+        if: env.MAKE_PUBLIC == 'true'
+        id: visibility
+        run: |
+          PACKAGE_PATH="public/${{ env.MODEL_NAME }}"
+          ENC_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${PACKAGE_PATH}', safe=''))")
+
+          # GET current visibility
+          VIS=$(curl -s \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/user/packages/container/${PACKAGE_NAME}/visibility" \
-            -d '{"visibility":"public"}'
+            -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
+            "https://api.github.com/user/packages/container/${ENC_PATH}/visibility" \
+            | jq -r .visibility)
+
+          echo "VISIBILITY=${VIS}" >> $GITHUB_ENV
+          echo "🔍 Visibilidade atual: ${VIS}"
+
+          # If not public, PATCH to public
+          if [[ "$VIS" != "public" ]]; then
+            echo "🔓 Tornando público..."
+            curl -s -X PATCH \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
+              "https://api.github.com/user/packages/container/${ENC_PATH}/visibility" \
+              -d '{"visibility":"public"}'
+            echo "✅ Agora público."
+          else
+            echo "ℹ️  Já estava público."
+          fi          
       
-      - name: Resultado
+      - name: Result
         run: |
           if [[ "${EXISTS}" == "true" ]]; then
-            echo "ℹ️ Nenhuma ação: imagem já existia em GHCR."
+            echo "ℹ️  Imagem já existia: ${TARGET}"
           else
-            echo "✅ Modelo publicado: ${TARGET}"
-            echo ""
-            echo "Para usar localmente:"
-            echo "ollama pull ${TARGET}"
+            echo "✅  Modelo publicado: ${TARGET}"
+          fi
+          if [[ "${MAKE_PUBLIC}" == "true" ]]; then
+            echo "🔔 Visibilidade final: ${VISIBILITY}"
+          else
+            echo "🔔 Visibilidade mantida como privada."
           fi
