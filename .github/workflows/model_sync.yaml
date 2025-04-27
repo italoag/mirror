@@ -1,4 +1,4 @@
-name: Fast Sync Ollama Model to GHCR
+name: Sync Ollama Model to GHCR
 
 on:
   workflow_dispatch:
