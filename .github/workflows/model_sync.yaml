@@ -153,33 +153,31 @@ jobs:
         if: env.MAKE_PUBLIC == 'true'
         id: visibility
         run: |
-          echo "🔓 Configurando visibilidade pública do pacote..."
-          PACKAGE_NAME=$(echo "${MODEL_NAME}" | tr '[:upper:]' '[:lower:]')
-          OWNER="${{ github.repository_owner }}"
+          PACKAGE_NAME="${{ env.MODEL_NAME }}"
+          PACKAGE_TYPE="container" # Altere se necessário para outro tipo de pacote
           
-          # Primeiro, verifique se é uma organização
-          ORG_CHECK=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${{ secrets.GHCR_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/orgs/${OWNER}")
-          
-          if [ "$ORG_CHECK" = "200" ]; then
-            # É uma organização
-            echo "📦 Configurando pacote para organização: ${OWNER}"
-            curl -X PATCH \
-              -H "Authorization: token ${{ secrets.GHCR_PAT }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE_NAME}/visibility" \
+          # GET current visibility
+          VIS=$(curl -s \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
+            "https://api.github.com/user/packages/${PACKAGE_TYPE}/${PACKAGE_NAME}" \
+            | jq -r .visibility)
+
+          echo "VISIBILITY=${VIS}" >> $GITHUB_ENV
+          echo "🔍 Visibilidade atual: ${VIS}"
+
+          # If not public, PATCH to set it public
+          if [[ "$VIS" != "public" ]]; then
+            echo "🔓 Tornando público..."
+            curl -s -X PATCH \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
+              "https://api.github.com/user/packages/${PACKAGE_TYPE}/${PACKAGE_NAME}" \
               -d '{"visibility":"public"}'
+            echo "✅ Agora público."
           else
-            # É um usuário
-            echo "📦 Configurando pacote para usuário: ${OWNER}"
-            curl -X PATCH \
-              -H "Authorization: token ${{ secrets.GHCR_PAT }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/user/packages/container/${PACKAGE_NAME}/visibility" \
-              -d '{"visibility":"public"}'
-          fi       
+            echo "ℹ️  Já estava público."
+          fi           
       
       - name: Result
         run: |
