@@ -57,56 +57,44 @@ jobs:
             echo "🔄 Forçando ressincronização"
           fi
       
-      - name: Sincronizar Modelo
+      - name: Usar Container Docker para Modelo Ollama
         if: env.EXISTS == 'false'
         run: |
-          echo "🐳 Executando container Ollama"
+          echo "🔍 Criando container Docker para buildar o modelo ${MODEL_FULL}"
           
-          # Criar diretório para dados do Ollama
-          mkdir -p /tmp/ollama-data
+          # Cria um Dockerfile temporário para construir a imagem Ollama
+          TEMP_DIR=$(mktemp -d)
           
-          # Iniciar container Ollama em background
-          docker run -d --name ollama -v /tmp/ollama-data:/root/.ollama -p 11434:11434 ollama/ollama
+          # Cria Dockerfile que usa a imagem do Ollama, baixa o modelo
+          # e depois copia os arquivos do modelo para uma nova imagem
+          cat > ${TEMP_DIR}/Dockerfile << 'EOF'
+          # Estágio 1: Baixar modelo com Ollama
+          FROM ollama/ollama:latest AS builder
+          ARG MODEL_NAME
           
-          # Aguardar inicialização do serviço
-          sleep 10
+          # Inicializar o Ollama e baixar o modelo
+          RUN ollama serve & \
+              sleep 5 && \
+              ollama pull ${MODEL_NAME} && \
+              sleep 2
           
-          echo "📥 Pull do modelo ${MODEL_FULL}"
-          docker exec ollama ollama pull ${MODEL_FULL}
+          # Encontrar arquivos do modelo e copiar para /tmp/model
+          RUN mkdir -p /tmp/model && \
+              find /root/.ollama -name "*.bin" -o -name "*.json" -o -name "*.gguf" | \
+              xargs -I{} cp -v {} /tmp/model/
           
-          # Encontrar onde o modelo está armazenado dentro do container
-          MODEL_DIR=$(docker exec ollama find /root/.ollama/models -type d -name "${MODEL_NAME}*${MODEL_TAG}*" | head -n 1)
-          
-          if [ -z "$MODEL_DIR" ]; then
-            echo "❌ Não foi possível encontrar o diretório do modelo dentro do container"
-            docker exec ollama ls -la /root/.ollama/models
-            exit 1
-          fi
-          
-          echo "📦 Modelo encontrado em: ${MODEL_DIR}"
-          
-          # Criar diretório temporário para o modelo no host
-          mkdir -p /tmp/model
-          
-          # Copiar os arquivos do modelo do container para o host
-          docker cp ollama:${MODEL_DIR}/. /tmp/model/
-          
-          # Criar Dockerfile
-          cat > /tmp/model/Dockerfile << EOF
+          # Estágio 2: Criar imagem final apenas com os arquivos do modelo
           FROM scratch
-          COPY . /
-          LABEL org.opencontainers.image.description="Ollama model ${MODEL_FULL}"
+          COPY --from=builder /tmp/model /
           CMD [""]
           EOF
           
-          # Construir e enviar imagem
-          cd /tmp/model
-          docker build -t ${TARGET} .
-          docker push ${TARGET}
+          # Construir a imagem Docker
+          cd ${TEMP_DIR}
+          docker build --build-arg MODEL_NAME=${MODEL_FULL} -t ${TARGET} .
           
-          # Limpar
-          docker stop ollama
-          docker rm ollama
+          # Push da imagem para o GHCR
+          docker push ${TARGET}
       
       - name: Resultado
         run: |
