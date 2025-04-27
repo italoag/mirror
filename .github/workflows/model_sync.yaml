@@ -1,6 +1,4 @@
-# .github/workflows/sync-ollama-model-to-ghcr.yml
 name: Sync Ollama Model to GHCR
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,14 +13,12 @@ on:
         required: false
         type: boolean
         default: false
-
 jobs:
   sync-model:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: Set Variables
         id: vars
@@ -37,14 +33,14 @@ jobs:
           echo "FORCE=${FORCE}"             >> $GITHUB_ENV
           echo "UPSTREAM=${UPSTREAM}"       >> $GITHUB_ENV
           echo "TARGET=${TARGET}"           >> $GITHUB_ENV
-
+      
       - name: Login no GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
-
+      
       - name: Check if Image Exists
         id: check
         continue-on-error: true
@@ -60,26 +56,72 @@ jobs:
             echo "EXISTS=false" >> $GITHUB_ENV
             echo "🔄 Forçando ressincronização"
           fi
-
-      - name: Pull, Tag & Push (sem Content Trust)
+      
+      # Tentativa 1: Desabilitar Content Trust no comando específico
+      - name: Tentativa 1 - Pull com flag --disable-content-trust
         if: env.EXISTS == 'false'
+        id: attempt1
+        continue-on-error: true
         run: |
-          export DOCKER_CONTENT_TRUST=0
-
           echo "📥 Pull ${UPSTREAM}"
           docker pull --disable-content-trust "${UPSTREAM}"
-
-          echo "🏷️  Tag ${TARGET}"
+          echo "ATTEMPT1_SUCCESS=true" >> $GITHUB_ENV
+      
+      # Tentativa 2: Instalar e usar Skopeo
+      - name: Instalar Skopeo
+        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+      
+      - name: Tentativa 2 - Skopeo Copy
+        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true'
+        id: attempt2
+        continue-on-error: true
+        run: |
+          echo "🔄 Copiando com Skopeo ${UPSTREAM} para ${TARGET}"
+          skopeo copy --all docker://${UPSTREAM} docker://${TARGET}
+          echo "ATTEMPT2_SUCCESS=true" >> $GITHUB_ENV
+      
+      # Tentativa 3: Usar Crane
+      - name: Instalar Crane
+        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true' && env.ATTEMPT2_SUCCESS != 'true'
+        run: |
+          go install github.com/google/go-containerregistry/cmd/crane@latest
+          export PATH=$PATH:$(go env GOPATH)/bin
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      
+      - name: Tentativa 3 - Crane Copy
+        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS != 'true' && env.ATTEMPT2_SUCCESS != 'true'
+        id: attempt3
+        continue-on-error: true
+        run: |
+          echo "🔄 Copiando com Crane ${UPSTREAM} para ${TARGET}"
+          crane copy "${UPSTREAM}" "${TARGET}"
+          echo "ATTEMPT3_SUCCESS=true" >> $GITHUB_ENV
+      
+      # Continuação do fluxo se a tentativa 1 foi bem-sucedida
+      - name: Tag & Push após Pull bem-sucedido
+        if: env.EXISTS == 'false' && env.ATTEMPT1_SUCCESS == 'true'
+        run: |
+          echo "🏷️ Tag ${TARGET}"
           docker tag "${UPSTREAM}" "${TARGET}"
-
+          
           echo "📤 Push ${TARGET}"
           docker push --disable-content-trust "${TARGET}"
-
-      - name: Resultado
+      
+      # Verificação final
+      - name: Verificar resultado final
+        if: always()
         run: |
           if [[ "${EXISTS}" == "true" ]]; then
-            echo "ℹ️  Nenhuma ação: imagem já existia em GHCR."
-          else
+            echo "ℹ️ Nenhuma ação: imagem já existia em GHCR."
+            exit 0
+          elif [[ "${ATTEMPT1_SUCCESS}" == "true" || "${ATTEMPT2_SUCCESS}" == "true" || "${ATTEMPT3_SUCCESS}" == "true" ]]; then
             echo "✅ Modelo publicado: ${TARGET}"
             echo "   Para usar: ollama pull ${TARGET}"
+            exit 0
+          else
+            echo "❌ Todas as tentativas falharam."
+            exit 1
           fi
