@@ -27,7 +27,7 @@ jobs:
           MODEL_TAG="${{ github.event.inputs.model_tag }}"
           FORCE="${{ github.event.inputs.force_resync }}"
           MODEL_FULL="${MODEL_NAME}:${MODEL_TAG}"
-          TARGET="ghcr.io/${{ github.repository_owner }}/public/${MODEL_NAME}:${MODEL_TAG}"
+          TARGET="ghcr.io/${{ github.repository_owner }}/${MODEL_NAME}:${MODEL_TAG}"
           echo "MODEL_NAME=${MODEL_NAME}" >> $GITHUB_ENV
           echo "MODEL_TAG=${MODEL_TAG}" >> $GITHUB_ENV
           echo "MODEL_FULL=${MODEL_FULL}" >> $GITHUB_ENV
@@ -57,43 +57,52 @@ jobs:
             echo "🔄 Forçando ressincronização"
           fi
       
-      - name: Usar Container Docker para Modelo Ollama
+      - name: Construir Imagem Ollama com Formato Correto
         if: env.EXISTS == 'false'
         run: |
-          echo "🔍 Criando container Docker para buildar o modelo ${MODEL_FULL}"
-          
-          # Cria um Dockerfile temporário para construir a imagem Ollama
+          # Criar diretório temporário
           TEMP_DIR=$(mktemp -d)
           
-          # Cria Dockerfile que usa a imagem do Ollama, baixa o modelo
-          # e depois copia os arquivos do modelo para uma nova imagem
+          echo "🔧 Criando Dockerfile compatível com Ollama para o modelo ${MODEL_FULL}"
+          
+          # Criar Dockerfile com formato correto para Ollama
           cat > ${TEMP_DIR}/Dockerfile << 'EOF'
           # Estágio 1: Baixar modelo com Ollama
           FROM ollama/ollama:latest AS builder
           ARG MODEL_NAME
           
-          # Inicializar o Ollama e baixar o modelo
-          RUN ollama serve & \
+          # Inicializar Ollama e baixar o modelo
+          RUN echo "📥 Iniciando Ollama e baixando modelo: ${MODEL_NAME}" && \
+              ollama serve & \
               sleep 5 && \
               ollama pull ${MODEL_NAME} && \
               sleep 2
           
-          # Encontrar arquivos do modelo e copiar para /tmp/model
-          RUN mkdir -p /tmp/model && \
+          # Localizar os arquivos do modelo
+          RUN mkdir -p /tmp/ollama_model && \
               find /root/.ollama -name "*.bin" -o -name "*.json" -o -name "*.gguf" | \
-              xargs -I{} cp -v {} /tmp/model/
+              xargs -I{} cp -v {} /tmp/ollama_model/ && \
+              find /root/.ollama -name "manifest.json" | \
+              xargs -I{} cp -v {} /tmp/ollama_model/
           
-          # Estágio 2: Criar imagem final apenas com os arquivos do modelo
+          # Estágio 2: Imagem final com estrutura Ollama-compatível
           FROM scratch
-          COPY --from=builder /tmp/model /
+          
+          # Copiar arquivos do modelo
+          COPY --from=builder /tmp/ollama_model /
+          
+          # Adicionar metadados específicos do Ollama
+          LABEL org.opencontainers.image.title="ollama-model"
+          LABEL org.opencontainers.image.description="Ollama model compatible image"
+          
           CMD [""]
           EOF
           
-          # Construir a imagem Docker
+          echo "🏗️ Construindo imagem Docker..."
           cd ${TEMP_DIR}
           docker build --build-arg MODEL_NAME=${MODEL_FULL} -t ${TARGET} .
           
-          # Push da imagem para o GHCR
+          echo "📤 Enviando imagem para GHCR..."
           docker push ${TARGET}
       
       - name: Resultado
@@ -102,5 +111,9 @@ jobs:
             echo "ℹ️ Nenhuma ação: imagem já existia em GHCR."
           else
             echo "✅ Modelo publicado: ${TARGET}"
-            echo "   Para usar: ollama pull ${TARGET}"
+            echo "Para usar localmente:"
+            echo "1. Crie um arquivo Modelfile:"
+            echo "FROM ${TARGET}"
+            echo "2. Execute: ollama create modelo-local -f ./Modelfile"
+            echo "3. Use: ollama run modelo-local"
           fi
