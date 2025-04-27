@@ -57,51 +57,108 @@ jobs:
             echo "🔄 Forçando ressincronização"
           fi
       
-      - name: Construir Imagem Ollama com Formato Correto
+      - name: Download e Sincronização do Modelo
         if: env.EXISTS == 'false'
         run: |
-          # Criar diretório temporário
-          TEMP_DIR=$(mktemp -d)
+          echo "🔄 Iniciando processo de sincronização para modelo ${MODEL_FULL}"
           
-          echo "🔧 Criando Dockerfile compatível com Ollama para o modelo ${MODEL_FULL}"
+          # Criar diretórios de trabalho
+          mkdir -p /tmp/ollama-data
+          mkdir -p /tmp/model-files
           
-          # Criar Dockerfile com formato correto para Ollama
-          cat > ${TEMP_DIR}/Dockerfile << 'EOF'
-          # Estágio 1: Baixar modelo com Ollama
-          FROM ollama/ollama:latest AS builder
-          ARG MODEL_NAME
+          # Baixar modelo usando container Ollama com volume mapeado
+          echo "📥 Baixando modelo ${MODEL_FULL}..."
+          docker run --name ollama-downloader \
+            -v /tmp/ollama-data:/root/.ollama \
+            ollama/ollama \
+            sh -c "ollama serve & sleep 5 && ollama pull ${MODEL_FULL} && sleep 2"
           
-          # Inicializar Ollama e baixar o modelo
-          RUN echo "📥 Iniciando Ollama e baixando modelo: ${MODEL_NAME}" && \
-              ollama serve & \
-              sleep 5 && \
-              ollama pull ${MODEL_NAME} && \
-              sleep 2
+          # Listar estrutura de diretórios para debug
+          echo "🔍 Estrutura de diretórios de volume do Ollama:"
+          find /tmp/ollama-data -type d | sort
           
-          # Localizar os arquivos do modelo
-          RUN mkdir -p /tmp/ollama_model && \
-              find /root/.ollama -name "*.bin" -o -name "*.json" -o -name "*.gguf" | \
-              xargs -I{} cp -v {} /tmp/ollama_model/ && \
-              find /root/.ollama -name "manifest.json" | \
-              xargs -I{} cp -v {} /tmp/ollama_model/
+          # Explorar e listar todos os arquivos grandes
+          echo "🔍 Procurando arquivos de modelo (>= 1MB):"
+          find /tmp/ollama-data -type f -size +1M | sort
           
-          # Estágio 2: Imagem final com estrutura Ollama-compatível
+          # Encontrar e copiar arquivos de modelo 
+          echo "📦 Copiando arquivos de modelo para diretório temporário..."
+          
+          # Arquivos binários (*.bin)
+          find /tmp/ollama-data -type f -name "*.bin" -exec cp -v {} /tmp/model-files/ \;
+          
+          # Arquivos GGUF (*.gguf)
+          find /tmp/ollama-data -type f -name "*.gguf" -exec cp -v {} /tmp/model-files/ \;
+          
+          # Arquivos JSON (*.json)
+          find /tmp/ollama-data -type f -name "*.json" -exec cp -v {} /tmp/model-files/ \;
+          
+          # Arquivos de modelo (model.*)
+          find /tmp/ollama-data -type f -name "model.*" -exec cp -v {} /tmp/model-files/ \;
+          
+          # Copiar quaisquer arquivos grandes (maior que 10MB) 
+          find /tmp/ollama-data -type f -size +10M -exec cp -v {} /tmp/model-files/ \;
+          
+          # Verificar se há arquivos copiados
+          echo "📋 Verificando arquivos copiados:"
+          ls -lah /tmp/model-files/
+          
+          # Verificar tamanho total
+          TOTAL_SIZE=$(du -sh /tmp/model-files/ | cut -f1)
+          echo "📊 Tamanho total dos arquivos copiados: ${TOTAL_SIZE}"
+          
+          if [ ! "$(ls -A /tmp/model-files/)" ]; then
+            echo "❌ Nenhum arquivo de modelo encontrado! Explorando mais diretórios..."
+            
+            # Tentativa adicional: copiar pastas inteiras
+            MODEL_BLOBS_DIR=$(find /tmp/ollama-data -path "*/blobs" -type d | head -n 1)
+            if [ -n "$MODEL_BLOBS_DIR" ]; then
+              echo "📦 Copiando diretório de blobs: ${MODEL_BLOBS_DIR}"
+              cp -r ${MODEL_BLOBS_DIR}/* /tmp/model-files/
+            fi
+            
+            # Verificar novamente
+            echo "📋 Verificando arquivos após tentativa adicional:"
+            ls -lah /tmp/model-files/
+            
+            TOTAL_SIZE=$(du -sh /tmp/model-files/ | cut -f1)
+            echo "📊 Tamanho total dos arquivos copiados: ${TOTAL_SIZE}"
+            
+            if [ ! "$(ls -A /tmp/model-files/)" ]; then
+              echo "❌ Falha ao encontrar arquivos de modelo!"
+              exit 1
+            fi
+          fi
+          
+          # Criar Dockerfile
+          echo "📝 Criando Dockerfile..."
+          cat > /tmp/model-files/Dockerfile << EOF
           FROM scratch
-          
-          # Copiar arquivos do modelo
-          COPY --from=builder /tmp/ollama_model /
-          
-          # Adicionar metadados específicos do Ollama
-          LABEL org.opencontainers.image.title="ollama-model"
-          LABEL org.opencontainers.image.description="Ollama model compatible image"
-          
+          COPY . /
+          LABEL org.opencontainers.image.title="${MODEL_FULL}"
+          LABEL org.opencontainers.image.description="Ollama model ${MODEL_FULL} synced via GitHub Actions"
+          LABEL org.opencontainers.image.source="https://github.com/ollama/ollama"
           CMD [""]
           EOF
           
+          # Construir imagem Docker
           echo "🏗️ Construindo imagem Docker..."
-          cd ${TEMP_DIR}
-          docker build --build-arg MODEL_NAME=${MODEL_FULL} -t ${TARGET} .
+          cd /tmp/model-files/
+          docker build -t ${TARGET} .
           
+          # Verificar tamanho da imagem
+          IMAGE_SIZE=$(docker image ls ${TARGET} --format "{{.Size}}")
+          echo "📊 Tamanho da imagem Docker: ${IMAGE_SIZE}"
+          
+          if [[ "${IMAGE_SIZE}" == *"kB"* || "${IMAGE_SIZE}" == *"KB"* ]]; then
+            echo "⚠️ Aviso: A imagem parece ser muito pequena (${IMAGE_SIZE})!"
+            if [[ "${IMAGE_SIZE}" == "1.1kB" || "${IMAGE_SIZE}" == "1.1KB" ]]; then
+              echo "❌ A imagem tem exatamente 1.1KB, o que indica que não há arquivos de modelo!"
+              exit 1
+            fi
+          fi
+          
+          # Enviar imagem para GHCR
           echo "📤 Enviando imagem para GHCR..."
           docker push ${TARGET}
       
@@ -111,9 +168,11 @@ jobs:
             echo "ℹ️ Nenhuma ação: imagem já existia em GHCR."
           else
             echo "✅ Modelo publicado: ${TARGET}"
+            echo ""
             echo "Para usar localmente:"
             echo "1. Crie um arquivo Modelfile:"
             echo "FROM ${TARGET}"
+            echo ""
             echo "2. Execute: ollama create modelo-local -f ./Modelfile"
             echo "3. Use: ollama run modelo-local"
           fi
