@@ -1,5 +1,5 @@
 # .github/workflows/sync-ollama-model-to-ghcr.yml
-name: Sync Ollama to GHCR (API)
+name: Sync Ollama Model to GHCR (API)
 
 on:
   workflow_dispatch:
@@ -12,11 +12,6 @@ on:
         required: true
       force_resync:
         description: 'Forçar ressincronização mesmo se já existir'
-        required: false
-        type: boolean
-        default: false
-      make_public:
-        description: 'Definir visibilidade pública após push?'
         required: false
         type: boolean
         default: false
@@ -35,16 +30,14 @@ jobs:
           MODEL_NAME="${{ github.event.inputs.model_name }}"
           MODEL_TAG="${{ github.event.inputs.model_tag }}"
           FORCE="${{ github.event.inputs.force_resync }}"
-          MAKE_PUBLIC="${{ github.event.inputs.make_public }}"
           MODEL_FULL="${MODEL_NAME}:${MODEL_TAG}"
           UPSTREAM="registry.ollama.ai/library/${MODEL_FULL}"
-          TARGET="ghcr.io/${{ github.repository_owner }}/public/${MODEL_FULL}"
+          TARGET="ghcr.io/${{ github.repository_owner }}/mirror/${MODEL_FULL}"
 
           echo "MODEL_NAME=${MODEL_NAME}"   >> $GITHUB_ENV
           echo "MODEL_TAG=${MODEL_TAG}"     >> $GITHUB_ENV
           echo "MODEL_FULL=${MODEL_FULL}"   >> $GITHUB_ENV
           echo "FORCE=${FORCE}"             >> $GITHUB_ENV
-          echo "MAKE_PUBLIC=${MAKE_PUBLIC}" >> $GITHUB_ENV
           echo "UPSTREAM=${UPSTREAM}"       >> $GITHUB_ENV
           echo "TARGET=${TARGET}"           >> $GITHUB_ENV
 
@@ -107,10 +100,9 @@ jobs:
           docker push --disable-content-trust "${TARGET}"
 
       - name: Check & Set Visibility
-        if: env.MAKE_PUBLIC == 'true'
         id: visibility
         run: |
-          PACKAGE_PATH="public/${{ env.MODEL_NAME }}"
+          PACKAGE_PATH="mirror/${{ env.MODEL_NAME }}"
           ENC_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${PACKAGE_PATH}', safe=''))")
 
           # GET current visibility
@@ -126,12 +118,7 @@ jobs:
           # If not public, PATCH to public
           if [[ "$VIS" != "public" ]]; then
             echo "🔓 Tornando público..."
-            curl -s -X PATCH \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
-              "https://api.github.com/user/packages/container/${ENC_PATH}/visibility" \
-              -d '{"visibility":"public"}'
-            echo "✅ Agora público."
+            echo "❌ Não é possível tornar publico automaticamente, API indisponível, necessário processo manual."
           else
             echo "ℹ️  Já estava público."
           fi
