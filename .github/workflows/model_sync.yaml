@@ -45,138 +45,156 @@ jobs:
         id: check
         continue-on-error: true
         run: |
+          IMAGE_EXISTS="false"
           if [[ "${FORCE}" != "true" ]]; then
             if docker manifest inspect "${TARGET}" >/dev/null 2>&1; then
-              echo "EXISTS=true" >> $GITHUB_ENV
+              IMAGE_EXISTS="true"
               echo "✅ Já existe: ${TARGET}"
-            else
-              echo "EXISTS=false" >> $GITHUB_ENV
             fi
-          else
-            echo "EXISTS=false" >> $GITHUB_ENV
-            echo "🔄 Forçando ressincronização"
           fi
+          echo "EXISTS=${IMAGE_EXISTS}" >> $GITHUB_ENV
       
-      - name: Configurar Ambiente para Ollama
+      - name: Instalar Dependências
         if: env.EXISTS == 'false'
         run: |
-          # Instalar Ollama localmente
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          
+          # Instalar Ollama
           curl -fsSL https://ollama.com/install.sh | sh
+      
+      - name: Exportar e Sincronizar Modelo
+        if: env.EXISTS == 'false'
+        run: |
+          echo "🔄 Exportando modelo ${MODEL_FULL}..."
           
-          # Criar diretórios de trabalho
-          mkdir -p /tmp/ollama-data
-          mkdir -p /tmp/model-files
+          # Definir variáveis
+          OLLAMA_HOME="$HOME/.ollama"
+          BLOBS_PATH="$OLLAMA_HOME/models/blobs"
+          MANIFESTS_PATH="$OLLAMA_HOME/models/manifests"
+          EXPORT_DIR="/tmp/ollama-export-${MODEL_NAME}-${MODEL_TAG}"
+          REGISTRY="registry.ollama.ai"
+          LIBRARY="library"
           
-          # Inicie o serviço Ollama
-          echo "🚀 Iniciando o serviço Ollama..."
+          # Criar diretório de exportação
+          mkdir -p "${EXPORT_DIR}"
+          
+          # Iniciar serviço Ollama
           ollama serve &
           sleep 5
           
           # Baixar o modelo
           echo "📥 Baixando modelo ${MODEL_FULL}..."
           ollama pull ${MODEL_FULL}
+          sleep 2
           
-          # Encontrar diretório onde o Ollama armazena os modelos
-          OLLAMA_DIR="$HOME/.ollama"
-          echo "🔍 Verificando diretório do Ollama: ${OLLAMA_DIR}"
-          
-          # Verificar estrutura de diretórios
-          echo "📂 Estrutura de diretórios:"
-          find ${OLLAMA_DIR} -type d | sort
-          
-          # Verificar arquivos grandes
-          echo "📄 Arquivos grandes (>10MB):"
-          find ${OLLAMA_DIR} -type f -size +10M | sort
-          
-          # Copiar arquivos relevantes
-          echo "📦 Copiando arquivos..."
-          
-          # Arquivos binários e de configuração
-          for EXT in "bin" "gguf" "json"; do
-            find ${OLLAMA_DIR} -name "*.${EXT}" -exec cp -v {} /tmp/model-files/ \;
-          done
-          
-          # Copiar arquivos grandes (modelo principal)
-          find ${OLLAMA_DIR} -type f -size +10M -exec cp -v {} /tmp/model-files/ \;
-          
-          # Verificar conteúdo
-          echo "📋 Arquivos copiados:"
-          ls -lah /tmp/model-files/
-          
-          # Se não encontrar arquivos, tentar diretório de blobs
-          if [ ! "$(ls -A /tmp/model-files/)" ]; then
-            echo "⚠️ Nenhum arquivo encontrado. Tentando copiar diretórios de blobs..."
-            BLOBS_DIR=$(find ${OLLAMA_DIR} -path "*/blobs" -type d | head -n 1)
+          # Verificar se o manifesto existe
+          MANIFEST_FILE="${MANIFESTS_PATH}/${REGISTRY}/${LIBRARY}/${MODEL_NAME}/${MODEL_TAG}"
+          if [ ! -f "${MANIFEST_FILE}" ]; then
+            echo "❌ Manifesto não encontrado: ${MANIFEST_FILE}"
             
-            if [ -n "$BLOBS_DIR" ]; then
-              echo "Copiando blobs de: ${BLOBS_DIR}"
-              cp -rv ${BLOBS_DIR}/* /tmp/model-files/
-            fi
+            # Listar diretórios para depuração
+            echo "📂 Estrutura de diretórios:"
+            find "${OLLAMA_HOME}" -type d | sort
             
-            # Verificar novamente
-            echo "📋 Arquivos após tentativa de blobs:"
-            ls -lah /tmp/model-files/
-          fi
-          
-          # Segunda alternativa - explorar /usr/local
-          if [ ! "$(ls -A /tmp/model-files/)" ]; then
-            echo "⚠️ Tentando localizar em /usr/local/share/ollama..."
-            if [ -d "/usr/local/share/ollama" ]; then
-              find /usr/local/share/ollama -type f -size +1M -exec cp -v {} /tmp/model-files/ \;
-            fi
-            
-            echo "📋 Arquivos após tentativa alternativa:"
-            ls -lah /tmp/model-files/
-          fi
-          
-          # Verificar tamanho total
-          TOTAL_SIZE=$(du -sh /tmp/model-files/ | cut -f1)
-          echo "📊 Tamanho total dos arquivos: ${TOTAL_SIZE}"
-          
-          if [ ! "$(ls -A /tmp/model-files/)" ]; then
-            echo "❌ Não foi possível encontrar os arquivos do modelo!"
-            
-            # Exploração mais profunda
-            echo "🔎 Realizando busca em todo o sistema por arquivos de modelo..."
-            sudo find / -name "*.gguf" -o -name "*.bin" -size +100M 2>/dev/null | grep -v "proc\|sys" | head -n 10
+            echo "📄 Manifestos encontrados:"
+            find "${MANIFESTS_PATH}" -type f | sort
             
             exit 1
           fi
           
+          echo "✅ Manifesto encontrado: ${MANIFEST_FILE}"
+          
+          # Criar Modelfile inicial
+          echo "FROM ./model.bin" > "${EXPORT_DIR}/Modelfile"
+          
+          # Processar as camadas do manifesto
+          echo "🔍 Processando camadas do manifesto..."
+          jq -r '.layers[].digest' "${MANIFEST_FILE}" | while read layer; do
+            BLOB_FILE="${BLOBS_PATH}/${layer//:/-}"
+            BLOB_TYPE=$(jq -r --arg layer "$layer" '.layers[] | select(.digest == $layer) | .mediaType' "${MANIFEST_FILE}" | sed 's|.*\.ollama\.image\.\(.*\)|\1|')
+            
+            echo "Processando: ${layer} (tipo: ${BLOB_TYPE})"
+            
+            case "${BLOB_TYPE}" in
+              model)
+                echo "📦 Copiando arquivo do modelo..."
+                cp "${BLOB_FILE}" "${EXPORT_DIR}/model.bin"
+                ;;
+              params)
+                echo "⚙️ Processando parâmetros..."
+                PARAMS_JSON=$(cat "${BLOB_FILE}")
+                echo "${PARAMS_JSON}" | jq -r 'keys[] as $key | .[$key][] | "PARAMETER \($key) \"\(.)\""' >> "${EXPORT_DIR}/Modelfile"
+                ;;
+              *)
+                TYPE_NAME=$(echo "${BLOB_TYPE}" | tr '[:lower:]' '[:upper:]')
+                FILE_CONTENT=$(cat "${BLOB_FILE}")
+                echo "${TYPE_NAME} \"\"\"${FILE_CONTENT}\"\"\"" >> "${EXPORT_DIR}/Modelfile"
+                ;;
+            esac
+          done
+          
+          # Verificar os arquivos exportados
+          echo "📋 Arquivos exportados:"
+          ls -lah "${EXPORT_DIR}"
+          
+          # Verificar tamanho do arquivo de modelo
+          if [ -f "${EXPORT_DIR}/model.bin" ]; then
+            MODEL_SIZE=$(du -sh "${EXPORT_DIR}/model.bin" | cut -f1)
+            echo "📊 Tamanho do arquivo de modelo: ${MODEL_SIZE}"
+          else
+            echo "❌ Arquivo de modelo não encontrado!"
+            exit 1
+          fi
+          
           # Criar Dockerfile
-          echo "📝 Criando Dockerfile..."
-          cat > /tmp/model-files/Dockerfile << EOF
+          cat > "${EXPORT_DIR}/Dockerfile" << EOF
           FROM scratch
           COPY . /
           LABEL org.opencontainers.image.title="${MODEL_FULL}"
           LABEL org.opencontainers.image.description="Ollama model ${MODEL_FULL} synced via GitHub Actions"
+          LABEL org.opencontainers.image.visibility="public"
           CMD [""]
           EOF
           
-          # Construir imagem
+          # Construir imagem Docker
           echo "🏗️ Construindo imagem Docker..."
-          cd /tmp/model-files/
-          docker build -t ${TARGET} .
+          cd "${EXPORT_DIR}"
+          docker build -t "${TARGET}" .
           
           # Verificar tamanho da imagem
-          IMAGE_SIZE=$(docker image ls ${TARGET} --format "{{.Size}}")
-          echo "📊 Tamanho da imagem: ${IMAGE_SIZE}"
+          IMAGE_SIZE=$(docker image ls "${TARGET}" --format "{{.Size}}")
+          echo "📊 Tamanho da imagem Docker: ${IMAGE_SIZE}"
           
+          # Verificar se a imagem tem tamanho razoável
           if [[ "${IMAGE_SIZE}" == *"kB"* || "${IMAGE_SIZE}" == *"KB"* ]]; then
-            echo "⚠️ A imagem parece muito pequena (${IMAGE_SIZE})!"
-            if [[ "${IMAGE_SIZE}" == "1.1kB" || "${IMAGE_SIZE}" == "1.1KB" ]]; then
-              echo "❌ A imagem tem exatamente 1.1KB, o que indica que não há arquivos de modelo!"
+            KB_SIZE=$(echo "${IMAGE_SIZE}" | sed 's/[^0-9]//g')
+            if [[ $KB_SIZE -lt 1000 ]]; then
+              echo "❌ A imagem é muito pequena (${IMAGE_SIZE})!"
               exit 1
             fi
           fi
           
+          # Definir visibilidade pública da imagem
+          echo "🔓 Configurando visibilidade pública..."
+          
           # Enviar imagem para GHCR
           echo "📤 Enviando imagem para GHCR..."
-          docker push ${TARGET}
+          docker push "${TARGET}"
+          
+          # Tornar o pacote público via API
+          REPO_NAME="${{ github.repository_owner }}/${MODEL_NAME}"
+          echo "🔓 Tornando o pacote público via API GitHub..."
+          
+          curl -X PATCH \
+            -H "Authorization: token ${{ secrets.GHCR_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/orgs/${{ github.repository_owner }}/packages/container/${MODEL_NAME}/versions" \
+            -d '{"visibility":"public"}'
       
       - name: Resultado
         run: |
-          if [[ "${EXISTS}" == "true" ]]; then
+          if [[ "${EXISTS}" == "true" && "${FORCE}" != "true" ]]; then
             echo "ℹ️ Nenhuma ação: imagem já existia em GHCR."
           else
             echo "✅ Modelo publicado: ${TARGET}"
