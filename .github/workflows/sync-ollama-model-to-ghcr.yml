@@ -66,11 +66,9 @@ jobs:
           fi
           echo "EXISTS=${EXISTS}" >> $GITHUB_ENV
 
-      - name: Download & Build & Push via Ollama API (no Trust)
+      - name: Download & Build & Push via Ollama API
         if: env.EXISTS == 'false'
         run: |
-          export DOCKER_CONTENT_TRUST=0
-
           echo "🔄 Baixando modelo ${MODEL_FULL} via API..."
           REG_URL="https://registry.ollama.ai/v2/library/${MODEL_NAME}/manifests/${MODEL_TAG}"
           curl -sL "$REG_URL" > manifest.json
@@ -96,8 +94,8 @@ jobs:
           EOF
 
           cd model-files
-          docker build --disable-content-trust -t "${TARGET}" .
-          docker push --disable-content-trust "${TARGET}"
+          docker build -t "${TARGET}" .
+          docker push "${TARGET}"
 
       - name: Check & Set Visibility
         id: visibility
