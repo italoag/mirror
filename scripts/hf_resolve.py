@@ -148,6 +148,82 @@ def is_projector(path: str) -> bool:
     return "mmproj" in os.path.basename(path).lower()
 
 
+def fetch_config(repo: str, revision: str, token: str) -> dict:
+    """Lê o config.json do repositório. Devolve {} se não houver (repos GGUF puros)."""
+    url = f"https://huggingface.co/{repo}/resolve/{urllib.parse.quote(revision, safe='')}/config.json"
+    status, body, _ = http_get(url, token)
+    if status != 200:
+        return {}
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+
+
+# Métodos de quantização que o mlx-lm converte ao carregar (mlx_lm/utils.py).
+MLX_QUANT_METHODS = {"bitnet", "mxfp4", "compressed-tensors", "awq", "gptq"}
+
+
+def compatibility(files: list[dict], has_gguf: bool, config: dict) -> dict:
+    """Diz quais clientes conseguem carregar o que está sendo publicado.
+
+    A resposta depende do formato do repositório de origem, não do espelhamento:
+    o workflow copia fielmente o que existe no Hugging Face. O caso que mais
+    surpreende é o MLX, que não lê GGUF de jeito nenhum — ele faz glob por
+    `model*.safetensors` e aborta se não achar.
+    """
+    paths = [f["path"] for f in files]
+    # O mesmo glob que o mlx-lm usa para achar os pesos.
+    mlx_weights = any(fnmatch.fnmatch(os.path.basename(p), "model*.safetensors") for p in paths)
+    any_safetensors = any(p.lower().endswith(".safetensors") for p in paths)
+
+    native_quant = config.get("quantization") or {}
+    legacy_quant = config.get("quantization_config") or {}
+    quant_method = str(legacy_quant.get("quant_method", "")).lower()
+    is_mlx_native = bool(native_quant.get("bits") or native_quant.get("group_size"))
+
+    if has_gguf:
+        ollama = ("sim", "camada GGUF nativa")
+    elif any_safetensors:
+        ollama = ("talvez", "importa safetensors só nas arquiteturas que ele suporta")
+    else:
+        ollama = ("não", "sem GGUF nem safetensors")
+
+    llama_cpp = ("sim", "GGUF") if has_gguf else ("não", "só lê GGUF")
+
+    if has_gguf:
+        lmstudio = ("sim", "GGUF")
+    elif is_mlx_native:
+        lmstudio = ("sim", "MLX pelo motor MLX (Apple Silicon)")
+    else:
+        lmstudio = ("não", "precisa de GGUF ou de pesos em formato MLX")
+
+    if not mlx_weights:
+        motivo = "o MLX não lê GGUF" if has_gguf else "não há model*.safetensors"
+        mlx = ("não", motivo)
+    elif is_mlx_native:
+        mlx = ("sim", "pesos já quantizados em formato MLX")
+    elif quant_method in MLX_QUANT_METHODS:
+        mlx = ("sim", f"quantização {quant_method}, convertida ao carregar")
+    elif quant_method:
+        mlx = ("não", f"quantização {quant_method} não suportada pelo mlx-lm")
+    else:
+        mlx = ("sim", "safetensors sem quantização, convertidos ao carregar")
+
+    transformers = (
+        ("sim", "safetensors") if any_safetensors else ("não", "sem safetensors")
+    )
+
+    return {
+        "ollama": ollama,
+        "llama.cpp": llama_cpp,
+        "lm studio": lmstudio,
+        "mlx": mlx,
+        "transformers/vLLM": transformers,
+        "_model_type": config.get("model_type", ""),
+    }
+
+
 def choose_gguf(files: list[dict], pattern: str) -> tuple[list[dict], list[str]]:
     """Escolhe um grupo GGUF. Devolve (arquivos escolhidos, grupos alternativos)."""
     candidates = [
@@ -253,6 +329,17 @@ def main() -> int:
             label = f"{package_default}-{label}"
         tag = sanitize(label, "latest")
 
+    compat = compatibility(snapshot, bool(gguf_group), fetch_config(repo, args.revision, token))
+    model_type = compat.pop("_model_type")
+    log("🔌 compatibilidade dos clientes com este modelo:")
+    for client, (verdict, reason) in compat.items():
+        icon = {"sim": "✅", "talvez": "⚠️ ", "não": "❌"}[verdict]
+        log(f"   {icon} {client:18} {reason}")
+    if model_type:
+        log(f"   (model_type = {model_type}; MLX e Ollama precisam suportar essa arquitetura)")
+    log("   Os artefatos são pesos, não binários: não têm arquitetura de CPU e")
+    log("   funcionam igual em Apple Silicon, x86_64 e ARM.")
+
     owner = sanitize(args.owner, "owner")
     plan = {
         "model_repo": repo,
@@ -273,6 +360,8 @@ def main() -> int:
         "snapshot_files": [f["path"] for f in snapshot],
         "snapshot_bytes": sum(f["size"] for f in snapshot),
         "alternatives": [os.path.basename(a) for a in alternatives],
+        "model_type": model_type,
+        "compat": {client: list(value) for client, value in compat.items()},
     }
 
     with open(args.output, "w", encoding="utf-8") as fh:

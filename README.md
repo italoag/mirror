@@ -12,6 +12,49 @@ Cada modelo é publicado em duas referências:
 
 ---
 
+## Qual cliente funciona com qual modelo
+
+O espelhamento é fiel: ele copia o formato que existe no Hugging Face, sem
+converter nada. Então a compatibilidade é a do **modelo de origem**, não do
+GHCR. A regra que mais pega gente de surpresa:
+
+> **MLX não lê GGUF.** O `mlx-lm` faz `glob("model*.safetensors")` e aborta com
+> `No safetensors found` se não achar. Espelhar um repo `*-GGUF` e esperar usar
+> no MLX não vai funcionar — nem aqui, nem baixando direto do Hugging Face.
+
+| Origem no HF | Ollama | llama.cpp | LM Studio | MLX | transformers |
+|---|:--:|:--:|:--:|:--:|:--:|
+| `*-GGUF` (bartowski, unsloth…) | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `mlx-community/*` (MLX quantizado) | ⚠️ | ❌ | ✅ | ✅ | ✅ |
+| safetensors fp16/bf16 | ⚠️ | ❌ | ❌ | ✅ | ✅ |
+| AWQ / GPTQ / MXFP4 | ⚠️ | ❌ | ❌ | ✅ | ✅ |
+| bitsandbytes 4/8-bit | ⚠️ | ❌ | ❌ | ❌ | ✅ |
+
+⚠️ = o Ollama importa safetensors, mas só nas arquiteturas que ele já
+implementa. O workflow tenta e falha alto se não der.
+
+**Se você quer cobrir Apple Silicon inteiro, espelhe dois repos:** um `*-GGUF`
+(Ollama, LM Studio, llama.cpp) e o `mlx-community/*` correspondente (MLX). São
+dois modelos diferentes no HF, então são duas execuções do workflow.
+
+O job `plan` publica essa tabela no resumo de cada execução, já resolvida para o
+modelo específico — ele lê o `config.json` do repositório e verifica o método de
+quantização contra o que o `mlx-lm` aceita.
+
+### Apple Silicon
+
+Sim, funciona — e não há nada a configurar. Os artefatos contêm **pesos, não
+executáveis**: um `.gguf` ou `.safetensors` não tem arquitetura de CPU. Nem o
+manifesto do Ollama nem o artefato OCI declaram `platform`, então não existe o
+problema de "imagem sem build arm64" que afeta o `image_sync.yml` (esse sim
+espelha imagens Docker, onde a arquitetura importa).
+
+O que precisa ser nativo para Apple Silicon é o **cliente**, e Ollama, LM Studio
+e MLX têm builds arm64 oficiais. A única garantia que o espelho não pode dar é a
+do formato: veja a tabela acima.
+
+---
+
 ## Workflows
 
 ### `Sync HF Model to GHCR`

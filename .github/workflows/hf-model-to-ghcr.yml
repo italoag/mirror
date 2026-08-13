@@ -119,6 +119,26 @@ jobs:
           python3 scripts/ghcr_ollama.py exists --repository "$repo" \
             --tag '${{ steps.resolve.outputs.hf_tag }}' --output-name snapshot_exists
 
+      - name: Publicar a matriz de compatibilidade no resumo
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+
+          plan = json.load(open("plan.json"))
+          icon = {"sim": "✅", "talvez": "⚠️", "não": "❌"}
+
+          print(f"## Compatibilidade de `{plan['model_repo']}`\n")
+          print("| Cliente | Funciona | Por quê |")
+          print("|---|:--:|---|")
+          for client, (verdict, reason) in plan["compat"].items():
+              print(f"| {client} | {icon[verdict]} | {reason} |")
+          if plan["model_type"]:
+              print(f"\n`model_type` = `{plan['model_type']}` — MLX e Ollama precisam ter "
+                    "essa arquitetura implementada.")
+          print("\nOs artefatos são pesos, não binários: não carregam arquitetura de CPU e "
+                "funcionam igual em Apple Silicon, x86_64 e ARM.")
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: plan
