@@ -1,0 +1,67 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/**', 'tests/**', '.github/workflows/**']
+  pull_request:
+    paths: ['scripts/**', 'tests/**', '.github/workflows/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compilar os scripts
+        run: python3 -m compileall -q scripts tests
+
+      - name: Checar a sintaxe dos scripts de shell
+        run: |
+          set -euo pipefail
+          bash -n scripts/pull-model.sh
+          # Os blocos `run:` dos workflows também são shell: um erro de sintaxe
+          # ali só apareceria no meio de uma publicação de 40 GB.
+          python3 - <<'PY'
+          import glob
+          import re
+          import subprocess
+          import sys
+          import tempfile
+
+          import yaml
+
+          falhas = []
+          for arquivo in sorted(glob.glob(".github/workflows/*.y*ml")):
+              doc = yaml.safe_load(open(arquivo, encoding="utf-8"))
+              for nome_job, job in (doc.get("jobs") or {}).items():
+                  for passo in job.get("steps") or []:
+                      script = passo.get("run")
+                      if not script:
+                          continue
+                      # As expressões ${{ }} são resolvidas antes do shell rodar.
+                      script = re.sub(r"\$\{\{[^}]*\}\}", "PLACEHOLDER", script)
+                      with tempfile.NamedTemporaryFile("w", suffix=".sh") as fh:
+                          fh.write(script)
+                          fh.flush()
+                          r = subprocess.run(["bash", "-n", fh.name], capture_output=True, text=True)
+                      alvo = f"{arquivo} :: {nome_job} :: {passo.get('name', '(sem nome)')}"
+                      if r.returncode:
+                          falhas.append(f"{alvo}\n{r.stderr.strip()}")
+                      else:
+                          print(f"ok {alvo}")
+          if falhas:
+              print("\n".join(falhas), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Testes de caminho e de vazamento de descritores
+        run: python3 tests/test_paths.py

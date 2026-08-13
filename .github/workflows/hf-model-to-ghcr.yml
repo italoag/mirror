@@ -165,7 +165,9 @@ jobs:
           name: plan
 
       - name: Preparar área de trabalho em disco
+        shell: bash
         run: |
+          set -euo pipefail
           # O disco raiz do runner tem ~20 GB livres; /mnt tem ~65 GB. Um GGUF
           # precisa caber duas vezes: o arquivo baixado e a cópia que o
           # `ollama create` grava no diretório de blobs.
@@ -173,15 +175,21 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" /mnt/hf /mnt/ollama /mnt/build
           df -h / /mnt
 
-          # O `ollama create` grava uma segunda cópia dos pesos no diretório de
-          # blobs, então o modelo precisa caber duas vezes.
           need_bytes=$(python3 -c "
           import json
           plan = json.load(open('plan.json'))
           size = plan['gguf_bytes'] or plan['snapshot_bytes']
           print(max(int(size * 2.2), 2 * 1024**3))
           ")
+          # Sem pipefail um `df` que falha vira string vazia, que a aritmética do
+          # bash lê como zero — e a comparação passaria a mentir. Daí o
+          # `set -o pipefail` acima e a validação explícita abaixo.
           free_bytes=$(df -B1 --output=avail /mnt | tail -1 | tr -dc '0-9')
+          if [[ ! "$free_bytes" =~ ^[0-9]+$ || ! "$need_bytes" =~ ^[0-9]+$ ]]; then
+            echo "❌ não foi possível medir o espaço em /mnt (livre='${free_bytes}', necessário='${need_bytes}')."
+            exit 1
+          fi
+          echo "espaço livre em /mnt: $((free_bytes/1024**3)) GiB | necessário: $((need_bytes/1024**3)) GiB"
           if (( free_bytes < need_bytes )); then
             echo "❌ /mnt tem $((free_bytes/1024**3)) GiB livres, o modelo precisa de ~$((need_bytes/1024**3)) GiB."
             echo "   Escolha uma quantização menor com o input file_pattern."
@@ -222,12 +230,30 @@ jobs:
           PY
           echo "--- Modelfile ---"; cat /mnt/build/Modelfile; echo "-----------------"
 
-          ollama serve &
+          # Sem guardar o log e o PID, um `ollama serve` que morre na largada
+          # (porta ocupada, instalação quebrada) só apareceria como 60 s de
+          # espera e um curl mudo.
+          ollama serve > /mnt/build/ollama-serve.log 2>&1 &
+          serve_pid=$!
+          ready=false
           for _ in $(seq 1 60); do
-            curl -sf http://127.0.0.1:11434/api/version >/dev/null && break
+            if ! kill -0 "$serve_pid" 2>/dev/null; then
+              echo '❌ o servidor do Ollama encerrou durante a inicialização:'
+              cat /mnt/build/ollama-serve.log
+              exit 1
+            fi
+            if curl -sf http://127.0.0.1:11434/api/version >/dev/null; then
+              ready=true
+              break
+            fi
             sleep 1
           done
-          curl -sf http://127.0.0.1:11434/api/version
+          if [[ "$ready" != "true" ]]; then
+            echo "❌ o servidor do Ollama não respondeu em 60 s:"
+            cat /mnt/build/ollama-serve.log
+            exit 1
+          fi
+          curl -sf http://127.0.0.1:11434/api/version; echo
 
           ollama create '${{ needs.plan.outputs.image }}' -f /mnt/build/Modelfile
           ollama list
@@ -296,20 +322,34 @@ jobs:
       - name: Publicar como artefato OCI
         run: |
           set -euo pipefail
-          oras login ghcr.io --username "$GHCR_USERNAME" --password-stdin <<< "$GHCR_TOKEN"
+          # `printf` é builtin e o token vai por um pipe: ele não aparece na
+          # linha de comando de nenhum processo. Uma here-string (<<<) seria
+          # equivalente do ponto de vista do argv, mas o bash a materializa num
+          # arquivo temporário — o pipe evita até isso.
+          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io \
+            --username "$GHCR_USERNAME" --password-stdin
 
           # Cada arquivo vira uma camada própria, com o caminho relativo no
           # annotation de título. Assim o `oras pull` reconstrói o diretório no
           # layout que MLX, transformers, LM Studio e llama.cpp esperam — e um
           # arquivo corrompido não obriga a rebaixar o modelo inteiro.
-          mapfile -t FILES < <(python3 - <<'PY'
+          # Delimitado por NUL: um caminho com quebra de linha viraria duas
+          # entradas do array e desalinharia a lista de argumentos. Os caminhos
+          # já foram validados no job `plan`, isto é a segunda barreira.
+          mapfile -d '' -t FILES < <(python3 - <<'PY'
           import json
+          import sys
+
           plan = json.load(open("plan.json"))
           for path in plan["snapshot_files"]:
-              print(f"{path}:application/octet-stream")
+              sys.stdout.write(f"{path}:application/octet-stream\0")
           PY
           )
           echo "📦 ${#FILES[@]} arquivos"
+          if (( ${#FILES[@]} == 0 )); then
+            echo "❌ o plano não lista nenhum arquivo para publicar."
+            exit 1
+          fi
 
           cd /mnt/hf
           rm -rf .cache

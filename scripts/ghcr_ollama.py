@@ -105,7 +105,11 @@ def request(
     try:
         resp = _opener.open(req, timeout=timeout)
     except urllib.error.HTTPError as exc:  # 4xx/5xx ainda carregam corpo útil
-        body = exc.read() if read_body else b""
+        # HTTPError também é um objeto de resposta, segurando o socket. Fechar
+        # explicitamente devolve a conexão em vez de deixá-la para o GC — e
+        # drenar o corpo é o que permite reaproveitá-la.
+        with exc:
+            body = exc.read() if read_body else b""
         return Response(exc.code, exc.headers, body, url)
     with resp:
         body = resp.read() if read_body else b""
@@ -433,6 +437,41 @@ def blob_path(models_dir: str, digest: str) -> str:
     return os.path.join(models_dir, "blobs", digest.replace(":", "-"))
 
 
+def safe_join(dest_root: str, name: str) -> str:
+    """Resolve `name` dentro de `dest_root`, recusando qualquer tentativa de fuga.
+
+    O nome vem do annotation `org.opencontainers.image.title` de um artefato do
+    registro, ou seja: entrada não confiável. A validação é feita sobre os
+    componentes do caminho em vez de sobre a string final, porque comparar
+    prefixos depois de `normpath` é lexical — passa por links simbólicos, e
+    ignora `\\` como separador fora do Windows.
+    """
+    if not name or "\x00" in name:
+        raise SystemExit(f"nome de arquivo inválido no artefato: {name!r}")
+    if any(ord(c) < 32 for c in name):
+        raise SystemExit(f"caractere de controle no nome do artefato: {name!r}")
+    # `\` é separador no Windows e caractere comum no Linux: tratar como
+    # separador nos dois casos é o lado seguro do erro.
+    parts = [p for p in re.split(r"[\\/]+", name) if p not in ("", ".")]
+    if not parts:
+        raise SystemExit(f"nome de arquivo vazio no artefato: {name!r}")
+    if any(p == ".." for p in parts):
+        raise SystemExit(f"caminho suspeito no artefato: {name!r}")
+    if os.path.isabs(name) or re.match(r"^[A-Za-z]:", name):
+        raise SystemExit(f"caminho absoluto no artefato: {name!r}")
+    return os.path.join(dest_root, *parts)
+
+
+def assert_inside(dest_root: str, path: str) -> None:
+    """Confere, já com links simbólicos resolvidos, que `path` está sob `dest_root`."""
+    root = os.path.realpath(dest_root)
+    real = os.path.realpath(path)
+    if real != root and not real.startswith(root + os.sep):
+        raise SystemExit(
+            f"o caminho {path!r} escapa do destino via link simbólico (resolve para {real!r})"
+        )
+
+
 def read_local_manifest(models_dir: str, host: str, namespace: str, model: str, tag: str) -> tuple[dict, bytes]:
     path = os.path.join(models_dir, "manifests", host, namespace, model, tag)
     if not os.path.isfile(path):
@@ -580,33 +619,52 @@ def cmd_pull(args) -> int:
 
     for layer in titled:
         name = layer["annotations"]["org.opencontainers.image.title"]
-        # O título vem do registro: um `../` ali não pode escrever fora do destino.
-        target = os.path.normpath(os.path.join(dest_root, name))
-        if not target.startswith(dest_root + os.sep):
-            raise SystemExit(f"caminho suspeito no artefato: {name!r}")
-
+        target = safe_join(dest_root, name)
         size = int(layer["size"])
-        if os.path.isfile(target) and os.path.getsize(target) == size:
-            log(f"   • {name} já baixado")
-            continue
+
+        try:
+            if os.path.getsize(target) == size:
+                log(f"   • {name} já baixado")
+                continue
+        except OSError:
+            # Não existe, ou sumiu entre a verificação e o uso: baixa de novo.
+            pass
 
         os.makedirs(os.path.dirname(target), exist_ok=True)
+        # Só depois de criar os diretórios dá para resolver os links simbólicos:
+        # um `sub/` pré-existente apontando para fora escaparia da checagem
+        # lexical, que não enxerga links.
+        assert_inside(dest_root, os.path.dirname(target))
+
         log(f"   ↓ {name} ({human(size)})")
         digest = layer["digest"]
         hasher = hashlib.sha256()
-        stream = reg.open_blob(digest)
-        with stream, open(target + ".part", "wb") as out:
-            while True:
-                chunk = stream.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                hasher.update(chunk)
-                out.write(chunk)
-        got = f"sha256:{hasher.hexdigest()}"
-        if got != digest:
-            os.remove(target + ".part")
-            raise SystemExit(f"digest divergente em {name}: esperado {digest}, obtido {got}")
-        os.replace(target + ".part", target)
+        partial = target + ".part"
+        try:
+            # O_NOFOLLOW fecha a última brecha: o próprio arquivo de destino não
+            # pode ser um link simbólico plantado antes.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(partial, flags, 0o644)
+            with reg.open_blob(digest) as stream, os.fdopen(fd, "wb") as out:
+                while True:
+                    chunk = stream.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    out.write(chunk)
+            got = f"sha256:{hasher.hexdigest()}"
+            if got != digest:
+                raise SystemExit(f"digest divergente em {name}: esperado {digest}, obtido {got}")
+            os.replace(partial, target)
+        except BaseException:
+            # Qualquer falha — rede, digest, Ctrl-C — não deixa lixo para trás.
+            # Sem isto, cada tentativa frustrada abandona um .part de vários GB
+            # que nenhuma execução seguinte remove.
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
+            raise
 
     log(f"✅ pronto: {os.path.abspath(args.dest)}")
     return 0
@@ -645,17 +703,32 @@ def cmd_verify(args) -> int:
         return 1
 
     manifest = resp.json()
-    media_type = manifest.get("mediaType")
-    if media_type != MANIFEST_MEDIA_TYPE:
-        log(f"❌ mediaType do manifesto é {media_type!r}, o Ollama espera {MANIFEST_MEDIA_TYPE!r}")
-        return 1
-
     entries = layers_of(manifest)
-    kinds = sorted({e.get("mediaType", "?") for e in entries})
-    log(f"✅ manifesto OK ({len(entries)} blobs): {', '.join(kinds)}")
+    is_ollama = any(
+        e.get("mediaType") == "application/vnd.ollama.image.model" for e in entries
+    )
+    titled = [
+        e for e in entries if (e.get("annotations") or {}).get("org.opencontainers.image.title")
+    ]
 
-    if not any(e.get("mediaType") == "application/vnd.ollama.image.model" for e in entries):
-        log("❌ nenhuma camada application/vnd.ollama.image.model — o Ollama não vai carregar")
+    if is_ollama:
+        media_type = manifest.get("mediaType")
+        if media_type != MANIFEST_MEDIA_TYPE:
+            log(
+                f"❌ mediaType do manifesto é {media_type!r}, "
+                f"o Ollama espera {MANIFEST_MEDIA_TYPE!r}"
+            )
+            return 1
+        kinds = sorted({e.get("mediaType", "?") for e in entries})
+        log(f"✅ manifesto Ollama OK ({len(entries)} blobs): {', '.join(kinds)}")
+    elif titled:
+        log(f"✅ artefato OCI público com {len(titled)} arquivos no layout do Hugging Face")
+    else:
+        log(
+            "❌ a tag é pública, mas não é nem um manifesto do Ollama (falta a camada "
+            "application/vnd.ollama.image.model) nem um snapshot HF (faltam os "
+            "annotations org.opencontainers.image.title)"
+        )
         return 1
 
     # Um Range de 1 byte por blob confirma o redirect para a CDN e a permissão de
@@ -669,7 +742,10 @@ def cmd_verify(args) -> int:
             log(f"❌ blob {digest} respondeu vazio")
             return 1
     log(f"✅ todos os {len(entries)} blobs acessíveis anonimamente")
-    log(f"👉 ollama pull {args.registry}/{args.repository}:{args.tag}")
+    if is_ollama:
+        log(f"👉 ollama pull {args.registry}/{args.repository}:{args.tag}")
+    else:
+        log(f"👉 oras pull {args.registry}/{args.repository}:{args.tag} -o ./modelo")
     return 0
 
 
