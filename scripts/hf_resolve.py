@@ -109,6 +109,35 @@ def list_files(repo: str, revision: str, token: str) -> list[dict]:
     return files
 
 
+def validate_paths(files: list[dict]) -> None:
+    """Recusa caminhos que quebrariam as etapas seguintes.
+
+    Os caminhos vêm da API do Hugging Face e atravessam duas ferramentas
+    sensíveis a caracteres especiais: o `oras push`, que recebe cada arquivo
+    como `caminho:media-type` na linha de comando, e o `snapshot_download`, que
+    os trata como padrões glob. Barrar aqui dá uma mensagem clara antes de
+    baixar nada, em vez de um erro obscuro 40 GB depois.
+    """
+    for entry in files:
+        path = entry["path"]
+        problema = None
+        if any(ord(c) < 32 for c in path):
+            problema = "contém caractere de controle"
+        elif path.startswith("-"):
+            problema = "começa com '-' e seria lido como flag pelo oras"
+        elif path.startswith("/") or re.match(r"^[A-Za-z]:", path):
+            problema = "é um caminho absoluto"
+        elif any(part == ".." for part in re.split(r"[\\/]+", path)):
+            problema = "contém '..'"
+        elif any(c in path for c in "*?[]"):
+            problema = "contém metacaractere de glob, que confundiria o download"
+        if problema:
+            raise SystemExit(
+                f"caminho inseguro no repositório: {path!r} — {problema}. "
+                "Use o input `exclude` para ignorá-lo."
+            )
+
+
 def matches(path: str, pattern: str) -> bool:
     return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(os.path.basename(path), pattern)
 
@@ -287,6 +316,7 @@ def main() -> int:
 
     excludes = list(DEFAULT_EXCLUDES) + [p.strip() for p in args.exclude.split(",") if p.strip()]
     files = [f for f in files if not excluded(f["path"], excludes)]
+    validate_paths(files)
 
     gguf_group, alternatives = choose_gguf(files, args.file_pattern)
     projectors = [f for f in files if f["path"].lower().endswith(".gguf") and is_projector(f["path"])]

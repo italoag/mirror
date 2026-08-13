@@ -82,6 +82,7 @@ binários — não declaram arquitetura de CPU. Veja
 | `ollama-model-to-ghcr.yml` | espelha um modelo da biblioteca pública do Ollama, em streaming |
 | `image_sync.yml` | espelha imagens Docker do Docker Hub (multi-arquitetura, via `skopeo`) |
 | `helm_chart_sync.yml` | espelha Helm charts |
+| `tests.yml` | compila os scripts, valida a sintaxe dos blocos `run:` e roda `tests/test_paths.py` |
 
 ## Scripts
 
@@ -92,6 +93,7 @@ binários — não declaram arquitetura de CPU. Veja
 | `scripts/hf_download.py` | baixa só os arquivos do plano via `snapshot_download` |
 | `scripts/pull-model.sh` | helper de download para cada cliente |
 | `scripts/check_image.sh` | verificação manual de imagens Docker comuns |
+| `tests/test_paths.py` | regressão do tratamento de caminhos vindos do registro e do Hugging Face |
 
 ## Secrets
 
