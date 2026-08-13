@@ -27,7 +27,7 @@ on:
         required: false
         default: '*.gguf'
       package_name:
-        description: 'Nome do pacote no GHCR (padrão: nome do repo HF em minúsculas)'
+        description: 'Pacote no GHCR (padrão: nome do repo HF). Use um nome fixo p/ agrupar todos os modelos num pacote só'
         required: false
         default: ''
       tag:
@@ -327,8 +327,11 @@ jobs:
             echo "| Ollama nativo | \`${IMAGE}\` | ${{ needs.ollama.result }} |"
             echo "| Snapshot HF (OCI) | \`${HF_IMAGE}\` | ${{ needs.snapshot.result }} |"
             echo
-            echo '> O pacote precisa estar **público** para `ollama pull` funcionar:'
-            echo '> o Ollama só usa token anônimo em registros de terceiros.'
+            echo '> O pacote precisa estar **público** para `ollama pull` funcionar — ele só'
+            echo '> usa token anônimo em registros de terceiros. A visibilidade do pacote não'
+            echo '> é herdada do repositório e não tem API: é um passo manual, uma vez por'
+            echo "> pacote, em [Packages](${{ github.server_url }}/${{ github.repository_owner }}?tab=packages)"
+            echo '> → Package settings → Change visibility → Public.'
             echo
             echo '### Ollama'
             echo '```bash'

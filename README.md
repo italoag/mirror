@@ -122,17 +122,42 @@ O `ollama pull` só obtém **token anônimo** em registros de terceiros — ele 
 tem como enviar credenciais do GHCR. Um pacote privado responde 403 e o pull
 falha, mesmo com o manifesto correto.
 
-Duas formas de resolver:
+**A visibilidade do pacote é independente da do repositório.** Ter o repositório
+público não basta: pacotes novos nascem **privados**, e a documentação do GitHub
+é explícita de que o pacote herda *as permissões de acesso, mas não a
+visibilidade* do repositório vinculado. Não existe endpoint REST (só há `GET`,
+`DELETE` e `POST /restore` em `/user/packages/...`) nem mutation GraphQL
+(só `deletePackageVersion`) para mudar visibilidade. Ou seja: **não dá para
+automatizar** — é a interface web ou nada.
 
-1. **Deixe o workflow usar o `GITHUB_TOKEN`** (não configure o secret
-   `GHCR_PAT`). Pacotes criados por ele ficam vinculados a este repositório e
-   herdam a visibilidade dele.
-2. **Com `GHCR_PAT`**, o pacote nasce privado. Abra
-   *Packages → o pacote → Package settings → Change visibility → Public*. Não
-   existe endpoint REST para isso; é um passo manual, uma vez por pacote.
+O que dá para fazer é pagar esse custo **uma única vez**:
 
-O snapshot `-hf` também precisa ser público para ser puxado sem credenciais,
-mas o `oras` e o helper aceitam token, então ele funciona privado.
+1. Publique todos os modelos como **tags de um mesmo pacote**, passando o mesmo
+   `package_name` em toda execução:
+
+   ```
+   model_repo   = bartowski/Qwen2.5-7B-Instruct-GGUF
+   package_name = models
+   ```
+
+   Isso gera `ghcr.io/italoag/models:qwen2.5-7b-instruct-gguf-q4_k_m`. Quando
+   `package_name` difere do nome derivado do repo HF, o nome do modelo entra na
+   tag automaticamente, então não há colisão entre modelos.
+
+2. Torne `models` público uma vez: **perfil → aba Packages → o pacote →
+   Package settings → Danger Zone → Change visibility → Public**. Toda tag
+   publicada depois nasce pública, sem passo manual.
+
+   ⚠️ Segundo a documentação do GitHub, tornar um pacote público é
+   **irreversível**.
+
+Se preferir um pacote por modelo (`ghcr.io/italoag/qwen3:q4_k_m`, mais bonito no
+`ollama list`), o passo manual se repete uma vez por modelo novo — nunca a cada
+sincronização. O passo de verificação do workflow detecta o caso e imprime o
+caminho exato a seguir.
+
+O snapshot `-hf` também precisa ser público para ser puxado sem credenciais, mas
+`oras` e o helper aceitam token — então ele funciona privado.
 
 ---
 
@@ -140,9 +165,14 @@ mas o `oras` e o helper aceitam token, então ele funciona privado.
 
 | Secret | Necessário | Para quê |
 |---|---|---|
-| `GITHUB_TOKEN` | automático | publicar no GHCR com visibilidade herdada |
-| `GHCR_PAT` | opcional | PAT com `write:packages`; use se o pacote não estiver vinculado a este repositório |
+| `GITHUB_TOKEN` | automático | publicar no GHCR; vincula o pacote a este repositório |
+| `GHCR_PAT` | opcional | PAT com `write:packages`; tem precedência quando existe |
 | `HF_TOKEN` | opcional | modelos *gated* no Hugging Face (Llama, Gemma…) |
+
+Nenhum dos dois afeta a visibilidade do pacote — ela é sempre privada no
+primeiro push. A diferença é o vínculo: publicando com o `GITHUB_TOKEN` o
+pacote já nasce ligado a este repositório e as workflows daqui ganham acesso
+automático a ele.
 
 ---
 

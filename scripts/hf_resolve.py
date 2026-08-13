@@ -236,8 +236,8 @@ def main() -> int:
         if not f["path"].lower().endswith(".gguf") or f["path"] in chosen_gguf
     ]
 
-    package_default = repo.split("/")[-1]
-    package = sanitize(args.package_name or package_default, "modelo")
+    package_default = sanitize(repo.split("/")[-1], "modelo")
+    package = sanitize(args.package_name, "modelo") if args.package_name else package_default
 
     if args.tag:
         tag = sanitize(args.tag, "latest")
@@ -245,7 +245,13 @@ def main() -> int:
         label = quant_label(gguf_group[0]["path"]) if gguf_group else ""
         if not label and safetensors:
             label = "safetensors"
-        tag = sanitize(label or "latest", "latest")
+        label = label or "latest"
+        # Num pacote compartilhado (package_name apontando para outro nome), a
+        # quantização sozinha colidiria entre modelos: `q4_k_m` serviria para
+        # todos. O nome do modelo entra na tag para manter as tags distintas.
+        if package != package_default:
+            label = f"{package_default}-{label}"
+        tag = sanitize(label, "latest")
 
     owner = sanitize(args.owner, "owner")
     plan = {

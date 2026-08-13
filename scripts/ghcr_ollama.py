@@ -621,9 +621,23 @@ def cmd_verify(args) -> int:
     reg = target_registry(args, anonymous=True)
     resp = reg.get_manifest(args.tag)
     if resp.status in (401, 403):
+        owner, _, package = args.repository.partition("/")
         log(
-            f"⚠️  {args.registry}/{args.repository}:{args.tag} não é público — o `ollama pull` "
-            "não consegue autenticar em registros de terceiros."
+            f"⚠️  O pacote {args.repository} ainda está PRIVADO. O manifesto foi publicado,\n"
+            f"    mas o `ollama pull` não vai funcionar: ele só usa token anônimo em\n"
+            f"    registros de terceiros, não tem como mandar credenciais do GHCR.\n"
+            f"\n"
+            f"    A visibilidade do pacote é separada da do repositório e NÃO é herdada\n"
+            f"    dele — pacotes novos nascem privados mesmo em repositório público.\n"
+            f"    Não existe endpoint REST nem mutation GraphQL para mudar isso.\n"
+            f"\n"
+            f"    Faça uma vez, pela web (vale para todas as tags futuras do pacote):\n"
+            f"      1. https://github.com/{owner}?tab=packages\n"
+            f"      2. abra o pacote {package} → Package settings\n"
+            f"      3. Danger Zone → Change visibility → Public\n"
+            f"\n"
+            f"    Dica: publicando todos os modelos como tags de um único pacote\n"
+            f"    (input package_name), esse passo acontece uma vez só, e nunca mais."
         )
         return 2
     if resp.status != 200:
