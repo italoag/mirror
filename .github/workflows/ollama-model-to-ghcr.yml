@@ -1,0 +1,109 @@
+name: Sync Ollama Model to GHCR
+
+# Espelha um modelo da biblioteca pública do Ollama para o GHCR preservando o
+# manifesto original, byte a byte. Como o formato de origem já é o que o
+# `ollama pull` espera, basta copiar os blobs — não há build de imagem no meio.
+#
+# A cópia é feita em streaming (registry.ollama.ai -> GHCR, sem tocar o disco),
+# então modelos de dezenas de GB passam sem estourar o runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Nome do modelo (ex: qwen3, deepseek-r1, llama3.2)'
+        required: true
+      model_tag:
+        description: 'Tag do modelo (ex: 8b, 7b, latest)'
+        required: true
+        default: 'latest'
+      package_name:
+        description: 'Nome do pacote no GHCR (padrão: o nome do modelo)'
+        required: false
+        default: ''
+      tag:
+        description: 'Tag no GHCR (padrão: a tag do modelo)'
+        required: false
+        default: ''
+      force_resync:
+        description: 'Republicar mesmo se a tag já existir'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GHCR_USERNAME: ${{ github.actor }}
+  GHCR_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+
+jobs:
+  mirror:
+    name: Espelhar modelo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Definir referências
+        id: vars
+        run: |
+          set -euo pipefail
+          normalize() { tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed 's/-*$//'; }
+
+          package=$(printf '%s' "${{ inputs.package_name || inputs.model_name }}" | normalize)
+          tag=$(printf '%s' "${{ inputs.tag || inputs.model_tag }}" | normalize)
+          owner=$(printf '%s' "${{ github.repository_owner }}" | normalize)
+
+          # O Ollama só entende host/namespace/modelo: um caminho a mais
+          # (ghcr.io/dono/mirror/modelo) torna a referência impossível de puxar.
+          echo "repository=${owner}/${package}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}"                     >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner}/${package}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "source=${{ inputs.model_name }}:${{ inputs.model_tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verificar se a tag já existe
+        id: check
+        run: |
+          if [[ "${{ inputs.force_resync }}" == "true" ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            python3 scripts/ghcr_ollama.py exists \
+              --repository '${{ steps.vars.outputs.repository }}' \
+              --tag '${{ steps.vars.outputs.tag }}'
+          fi
+
+      - name: Copiar manifesto e blobs para o GHCR
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          python3 scripts/ghcr_ollama.py mirror \
+            --model '${{ steps.vars.outputs.source }}' \
+            --repository '${{ steps.vars.outputs.repository }}' \
+            --tag '${{ steps.vars.outputs.tag }}'
+
+      - name: Validar o pull anônimo (o mesmo caminho do `ollama pull`)
+        continue-on-error: true
+        run: |
+          python3 scripts/ghcr_ollama.py verify \
+            --repository '${{ steps.vars.outputs.repository }}' \
+            --tag '${{ steps.vars.outputs.tag }}'
+
+      - name: Resumo
+        run: |
+          {
+            echo "## Modelo espelhado"
+            echo
+            echo "\`${{ steps.vars.outputs.source }}\` → \`${{ steps.vars.outputs.image }}\`"
+            echo
+            echo '> O pacote precisa estar **público** para `ollama pull` funcionar.'
+            echo
+            echo '```bash'
+            echo "ollama pull ${{ steps.vars.outputs.image }}"
+            echo "ollama run ${{ steps.vars.outputs.image }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

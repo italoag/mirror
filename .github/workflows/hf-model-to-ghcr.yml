@@ -1,0 +1,368 @@
+name: Sync HF Model to GHCR
+
+# Publica um modelo do Hugging Face no GHCR em dois formatos complementares:
+#
+#   ghcr.io/<owner>/<pacote>:<tag>       manifesto nativo do Ollama  -> ollama pull
+#   ghcr.io/<owner>/<pacote>:<tag>-hf    artefato OCI com o layout HF -> oras pull
+#                                        (LM Studio, MLX, llama.cpp, transformers…)
+#
+# O formato do Ollama não é uma imagem Docker: é um manifesto
+# application/vnd.docker.distribution.manifest.v2+json cujas camadas usam
+# application/vnd.ollama.image.*. Por isso o modelo é montado pelo próprio
+# `ollama create` e enviado ao registro por scripts/ghcr_ollama.py, em vez de
+# `docker build` + `docker push`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_repo:
+        description: 'Repositório HF (ex: bartowski/Qwen2.5-7B-Instruct-GGUF)'
+        required: true
+      revision:
+        description: 'Branch, tag ou commit do repositório HF'
+        required: false
+        default: 'main'
+      file_pattern:
+        description: 'Glob do GGUF a publicar (ex: "*Q4_K_M*.gguf")'
+        required: false
+        default: '*.gguf'
+      package_name:
+        description: 'Pacote no GHCR (padrão: nome do repo HF). Use um nome fixo p/ agrupar todos os modelos num pacote só'
+        required: false
+        default: ''
+      tag:
+        description: 'Tag no GHCR (padrão: a quantização detectada, ex: q4_k_m)'
+        required: false
+        default: ''
+      publish_ollama:
+        description: 'Publicar o formato nativo do Ollama'
+        required: false
+        type: boolean
+        default: true
+      publish_hf_snapshot:
+        description: 'Publicar o snapshot HF como artefato OCI'
+        required: false
+        type: boolean
+        default: true
+      exclude:
+        description: 'Padrões extras a ignorar, separados por vírgula'
+        required: false
+        default: ''
+      force_resync:
+        description: 'Republicar mesmo se a tag já existir'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # GHCR_PAT continua funcionando, mas o GITHUB_TOKEN é preferível: pacotes
+  # criados por ele são vinculados a este repositório e herdam a visibilidade
+  # dele, o que evita o passo manual de tornar o pacote público.
+  GHCR_USERNAME: ${{ github.actor }}
+  GHCR_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+jobs:
+  plan:
+    name: Resolver modelo
+    runs-on: ubuntu-latest
+    outputs:
+      repository: ${{ steps.resolve.outputs.repository }}
+      package: ${{ steps.resolve.outputs.package }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      hf_tag: ${{ steps.resolve.outputs.hf_tag }}
+      image: ${{ steps.resolve.outputs.image }}
+      hf_image: ${{ steps.resolve.outputs.hf_image }}
+      has_gguf: ${{ steps.resolve.outputs.has_gguf }}
+      has_safetensors: ${{ steps.resolve.outputs.has_safetensors }}
+      has_snapshot: ${{ steps.resolve.outputs.has_snapshot }}
+      gguf_bytes: ${{ steps.resolve.outputs.gguf_bytes }}
+      snapshot_bytes: ${{ steps.resolve.outputs.snapshot_bytes }}
+      ollama_exists: ${{ steps.check.outputs.ollama_exists }}
+      snapshot_exists: ${{ steps.check.outputs.snapshot_exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolver arquivos, nome do pacote e tag
+        id: resolve
+        run: |
+          python3 scripts/hf_resolve.py \
+            --model-repo "${{ inputs.model_repo }}" \
+            --revision "${{ inputs.revision }}" \
+            --file-pattern "${{ inputs.file_pattern }}" \
+            --package-name "${{ inputs.package_name }}" \
+            --tag "${{ inputs.tag }}" \
+            --owner "${{ github.repository_owner }}" \
+            --exclude "${{ inputs.exclude }}" \
+            --output plan.json
+
+      - name: Verificar o que já existe no GHCR
+        id: check
+        run: |
+          if [[ "${{ inputs.force_resync }}" == "true" ]]; then
+            echo "🔁 force_resync ligado: republicando as duas tags."
+            echo "ollama_exists=false"   >> "$GITHUB_OUTPUT"
+            echo "snapshot_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          repo='${{ steps.resolve.outputs.repository }}'
+          python3 scripts/ghcr_ollama.py exists --repository "$repo" \
+            --tag '${{ steps.resolve.outputs.tag }}'    --output-name ollama_exists
+          python3 scripts/ghcr_ollama.py exists --repository "$repo" \
+            --tag '${{ steps.resolve.outputs.hf_tag }}' --output-name snapshot_exists
+
+      - name: Publicar a matriz de compatibilidade no resumo
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+
+          plan = json.load(open("plan.json"))
+          icon = {"sim": "✅", "talvez": "⚠️", "não": "❌"}
+
+          print(f"## Compatibilidade de `{plan['model_repo']}`\n")
+          print("| Cliente | Funciona | Por quê |")
+          print("|---|:--:|---|")
+          for client, (verdict, reason) in plan["compat"].items():
+              print(f"| {client} | {icon[verdict]} | {reason} |")
+          if plan["model_type"]:
+              print(f"\n`model_type` = `{plan['model_type']}` — MLX e Ollama precisam ter "
+                    "essa arquitetura implementada.")
+          print("\nOs artefatos são pesos, não binários: não carregam arquitetura de CPU e "
+                "funcionam igual em Apple Silicon, x86_64 e ARM.")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 1
+
+  ollama:
+    name: Publicar formato nativo Ollama
+    needs: plan
+    if: >-
+      ${{ inputs.publish_ollama
+          && needs.plan.outputs.ollama_exists != 'true'
+          && (needs.plan.outputs.has_gguf == 'true' || needs.plan.outputs.has_safetensors == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+
+      - name: Preparar área de trabalho em disco
+        run: |
+          # O disco raiz do runner tem ~20 GB livres; /mnt tem ~65 GB. Um GGUF
+          # precisa caber duas vezes: o arquivo baixado e a cópia que o
+          # `ollama create` grava no diretório de blobs.
+          sudo mkdir -p /mnt/hf /mnt/ollama /mnt/build
+          sudo chown -R "$(id -u):$(id -g)" /mnt/hf /mnt/ollama /mnt/build
+          df -h / /mnt
+
+          # O `ollama create` grava uma segunda cópia dos pesos no diretório de
+          # blobs, então o modelo precisa caber duas vezes.
+          need_bytes=$(python3 -c "
+          import json
+          plan = json.load(open('plan.json'))
+          size = plan['gguf_bytes'] or plan['snapshot_bytes']
+          print(max(int(size * 2.2), 2 * 1024**3))
+          ")
+          free_bytes=$(df -B1 --output=avail /mnt | tail -1 | tr -dc '0-9')
+          if (( free_bytes < need_bytes )); then
+            echo "❌ /mnt tem $((free_bytes/1024**3)) GiB livres, o modelo precisa de ~$((need_bytes/1024**3)) GiB."
+            echo "   Escolha uma quantização menor com o input file_pattern."
+            exit 1
+          fi
+
+      - name: Instalar Ollama
+        run: |
+          curl -fsSL https://ollama.com/download/ollama-linux-amd64.tgz -o /tmp/ollama.tgz
+          sudo tar -C /usr -xzf /tmp/ollama.tgz
+          rm -f /tmp/ollama.tgz
+          ollama --version
+
+      - name: Baixar os pesos do Hugging Face
+        run: |
+          pip install --quiet --upgrade huggingface_hub
+          python3 scripts/hf_download.py \
+            --plan plan.json --dest /mnt/hf --set model
+
+      - name: Montar o modelo com `ollama create`
+        env:
+          OLLAMA_MODELS: /mnt/ollama
+        run: |
+          set -euo pipefail
+
+          # Uma linha FROM por arquivo: shards de um GGUF dividido precisam ser
+          # entregues juntos, e um mmproj vira camada de projetor sozinho.
+          python3 - <<'PY' > /mnt/build/Modelfile
+          import json
+          plan = json.load(open("plan.json"))
+          files = list(plan["gguf_files"]) + list(plan["projector_files"])
+          if files:
+              for path in files:
+                  print(f"FROM /mnt/hf/{path}")
+          else:
+              # Sem GGUF: o Ollama converte os safetensors do diretório.
+              print("FROM /mnt/hf")
+          PY
+          echo "--- Modelfile ---"; cat /mnt/build/Modelfile; echo "-----------------"
+
+          ollama serve &
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:11434/api/version >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:11434/api/version
+
+          ollama create '${{ needs.plan.outputs.image }}' -f /mnt/build/Modelfile
+          ollama list
+
+          # Os pesos originais já estão duplicados no diretório de blobs.
+          rm -rf /mnt/hf
+          df -h /mnt
+
+      - name: Enviar blobs e manifesto para o GHCR
+        run: |
+          python3 scripts/ghcr_ollama.py push \
+            --models-dir /mnt/ollama \
+            --source '${{ needs.plan.outputs.image }}' \
+            --repository '${{ needs.plan.outputs.repository }}' \
+            --tag '${{ needs.plan.outputs.tag }}'
+
+      - name: Validar o pull anônimo (o mesmo caminho do `ollama pull`)
+        continue-on-error: true
+        run: |
+          python3 scripts/ghcr_ollama.py verify \
+            --repository '${{ needs.plan.outputs.repository }}' \
+            --tag '${{ needs.plan.outputs.tag }}'
+
+  snapshot:
+    name: Publicar snapshot HF (artefato OCI)
+    needs: plan
+    if: >-
+      ${{ inputs.publish_hf_snapshot
+          && needs.plan.outputs.snapshot_exists != 'true'
+          && needs.plan.outputs.has_snapshot == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Preparar área de trabalho em disco
+        run: |
+          sudo mkdir -p /mnt/hf
+          sudo chown -R "$(id -u):$(id -g)" /mnt/hf
+          need_bytes=$(python3 -c "
+          import json
+          print(max(int(json.load(open('plan.json'))['snapshot_bytes'] * 1.15), 2 * 1024**3))
+          ")
+          free_bytes=$(df -B1 --output=avail /mnt | tail -1 | tr -dc '0-9')
+          if (( free_bytes < need_bytes )); then
+            echo "❌ /mnt tem $((free_bytes/1024**3)) GiB livres, o snapshot precisa de ~$((need_bytes/1024**3)) GiB."
+            exit 1
+          fi
+          df -h /mnt
+
+      - name: Baixar o snapshot do Hugging Face
+        run: |
+          pip install --quiet --upgrade huggingface_hub
+          python3 scripts/hf_download.py \
+            --plan plan.json --dest /mnt/hf --set snapshot
+
+      - name: Publicar como artefato OCI
+        run: |
+          set -euo pipefail
+          oras login ghcr.io --username "$GHCR_USERNAME" --password-stdin <<< "$GHCR_TOKEN"
+
+          # Cada arquivo vira uma camada própria, com o caminho relativo no
+          # annotation de título. Assim o `oras pull` reconstrói o diretório no
+          # layout que MLX, transformers, LM Studio e llama.cpp esperam — e um
+          # arquivo corrompido não obriga a rebaixar o modelo inteiro.
+          mapfile -t FILES < <(python3 - <<'PY'
+          import json
+          plan = json.load(open("plan.json"))
+          for path in plan["snapshot_files"]:
+              print(f"{path}:application/octet-stream")
+          PY
+          )
+          echo "📦 ${#FILES[@]} arquivos"
+
+          cd /mnt/hf
+          rm -rf .cache
+          # image-spec v1.0: o artifactType vira o mediaType do config em vez de
+          # um descritor vazio da OCI 1.1, que nem todo registro digere.
+          oras push '${{ needs.plan.outputs.hf_image }}' \
+            --image-spec v1.0 \
+            --artifact-type application/vnd.huggingface.model.v1+json \
+            --concurrency 4 \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.description=Snapshot de ${{ inputs.model_repo }} (${{ inputs.revision }})" \
+            --annotation "io.huggingface.repo=${{ inputs.model_repo }}" \
+            --annotation "io.huggingface.revision=${{ inputs.revision }}" \
+            "${FILES[@]}"
+
+      - name: Conferir o artefato publicado
+        run: |
+          oras manifest fetch --pretty '${{ needs.plan.outputs.hf_image }}' | head -40
+
+  summary:
+    name: Resumo
+    needs: [plan, ollama, snapshot]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Escrever instruções de uso
+        run: |
+          IMAGE='${{ needs.plan.outputs.image }}'
+          HF_IMAGE='${{ needs.plan.outputs.hf_image }}'
+          {
+            echo "## Modelo publicado"
+            echo
+            echo "| Formato | Referência | Job |"
+            echo "|---|---|---|"
+            echo "| Ollama nativo | \`${IMAGE}\` | ${{ needs.ollama.result }} |"
+            echo "| Snapshot HF (OCI) | \`${HF_IMAGE}\` | ${{ needs.snapshot.result }} |"
+            echo
+            echo '> O pacote precisa estar **público** para `ollama pull` funcionar — ele só'
+            echo '> usa token anônimo em registros de terceiros. A visibilidade do pacote não'
+            echo '> é herdada do repositório e não tem API: é um passo manual, uma vez por'
+            echo "> pacote, em [Packages](${{ github.server_url }}/${{ github.repository_owner }}?tab=packages)"
+            echo '> → Package settings → Change visibility → Public.'
+            echo
+            echo '### Ollama'
+            echo '```bash'
+            echo "ollama pull ${IMAGE}"
+            echo "ollama run ${IMAGE}"
+            echo '```'
+            echo
+            echo '### LM Studio, MLX, llama.cpp, transformers'
+            echo '```bash'
+            echo "oras pull ${HF_IMAGE} -o ./modelo"
+            echo "# ou, com o helper deste repositório:"
+            echo "./scripts/pull-model.sh ${HF_IMAGE} --for lmstudio"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
