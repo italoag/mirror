@@ -188,8 +188,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_PAT != '' && secrets.GHCR_PAT || github.token }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT || github.token }}
       
       # Login no Docker Hub para garantir acesso completo às imagens
       - name: Login no Docker Hub
