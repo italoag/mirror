@@ -76,6 +76,8 @@ jobs:
       - name: Verificar se a imagem existe no GHCR
         id: check-ghcr
         continue-on-error: true
+        env:
+          GHCR_AUTH_TOKEN: ${{ secrets.GHCR_PAT || github.token }}
         run: |
           # Extrair caminho da imagem para o GHCR
           if [[ "${{ env.IMAGE_NAME }}" == *"/"* ]]; then
@@ -87,8 +89,9 @@ jobs:
           fi
           
           # Verificação HTTP para o manifesto da imagem no GHCR
+          GHCR_TOKEN_B64=$(printf '%s' "$GHCR_AUTH_TOKEN" | base64 -w0)
           STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GHCR_PAT }}" \
+            -H "Authorization: Bearer $GHCR_TOKEN_B64" \
             "https://ghcr.io/v2/${GHCR_PATH}/manifests/${{ env.IMAGE_TAG }}")
           
           echo "Status HTTP GHCR: $STATUS_CODE"
@@ -187,6 +190,7 @@ jobs:
         if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
         uses: docker/login-action@v3
         with:
+          logout: false
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT || github.token }}
@@ -196,6 +200,7 @@ jobs:
         if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
         uses: docker/login-action@v3
         with:
+          logout: false
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       
