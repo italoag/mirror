@@ -31,6 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/pull-model.sh
+          bash -n scripts/image-mirror.sh
           # Os blocos `run:` dos workflows também são shell: um erro de sintaxe
           # ali só apareceria no meio de uma publicação de 40 GB.
           python3 - <<'PY'
@@ -68,3 +69,6 @@ jobs:
 
       - name: Testes de caminho e de vazamento de descritores
         run: python3 tests/test_paths.py
+
+      - name: Testes do mapeamento de imagens
+        run: bash tests/test_image_mirror.sh
