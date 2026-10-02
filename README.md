@@ -80,9 +80,32 @@ binários — não declaram arquitetura de CPU. Veja
 |---|---|
 | `hf-model-to-ghcr.yml` | publica um modelo do Hugging Face |
 | `ollama-model-to-ghcr.yml` | espelha um modelo da biblioteca pública do Ollama, em streaming |
-| `image_sync.yml` | espelha imagens Docker do Docker Hub (multi-arquitetura, via `skopeo`) |
+| `image_sync.yml` | espelha imagens Docker de qualquer registro — Docker Hub, quay.io, registry.k8s.io… (multi-arquitetura, via `skopeo`) |
 | `helm_chart_sync.yml` | espelha Helm charts |
-| `tests.yml` | compila os scripts, valida a sintaxe dos blocos `run:` e roda `tests/test_paths.py` |
+| `tests.yml` | compila os scripts, valida a sintaxe dos blocos `run:` e roda `tests/test_paths.py` e `tests/test_image_mirror.sh` |
+
+### Imagens Docker
+
+Sem registro no `image_name`, a origem é o Docker Hub e o caminho é mantido;
+com registro, o host entra no caminho do espelho:
+
+| Origem | Espelho |
+|---|---|
+| `grafana/mimir:3.0.1` | `ghcr.io/italoag/mirror/grafana/mimir:3.0.1` |
+| `quay.io/strimzi/kafka:0.49.1-kafka-4.0.0` | `ghcr.io/italoag/mirror/quay.io/strimzi/kafka:0.49.1-kafka-4.0.0` |
+
+```bash
+gh workflow run image_sync.yml -R italoag/mirror -f image_name=quay.io/strimzi/kafka -f image_tag=0.49.1-kafka-4.0.0
+
+# baixa o espelho e cria a tag com o nome original (manifests e charts não mudam)
+scripts/image-mirror.sh pull quay.io/strimzi/kafka:0.49.1-kafka-4.0.0
+```
+
+A tag local só resolve no Kubernetes com `imagePullPolicy: IfNotPresent`: com
+`Always` o kubelet consulta o registro original mesmo com a imagem no cache.
+Pacotes novos nascem privados — para baixá-los, autentique o Docker uma vez com
+um token `read:packages`:
+`gh auth refresh -s read:packages && gh auth token | docker login ghcr.io -u <owner> --password-stdin`.
 
 ## Scripts
 
@@ -93,7 +116,9 @@ binários — não declaram arquitetura de CPU. Veja
 | `scripts/hf_download.py` | baixa só os arquivos do plano via `snapshot_download` |
 | `scripts/pull-model.sh` | helper de download para cada cliente |
 | `scripts/check_image.sh` | verificação manual de imagens Docker comuns |
+| `scripts/image-mirror.sh` | mapeia imagem → espelho no GHCR (`resolve`, usado pelo `image_sync.yml`) e baixa o espelho com o nome original (`pull`) |
 | `tests/test_paths.py` | regressão do tratamento de caminhos vindos do registro e do Hugging Face |
+| `tests/test_image_mirror.sh` | regressão do mapeamento origem → espelho |
 
 ## Secrets
 

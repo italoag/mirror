@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       image_name:
-        description: 'Nome da imagem (ex: ethereum/client-go)'
+        description: 'Nome da imagem; sem registro = Docker Hub (ex: ethereum/client-go, quay.io/strimzi/kafka)'
         required: true
       image_tag:
         description: 'Tag da imagem (ex: release-1.10)'
@@ -36,158 +36,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
       - name: Determinar imagem a sincronizar
-        id: set-image-info
+        env:
+          # Inputs do workflow_dispatch, ou dados do repository_dispatch, ou a
+          # imagem predefinida da execução agendada. Entram por env para não
+          # serem interpolados no script.
+          IMAGE_NAME: ${{ github.event.inputs.image_name || github.event.client_payload.image_name || 'ethereum/client-go' }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag || github.event.client_payload.image_tag || 'release-1.10' }}
+          FORCE_RESYNC: ${{ github.event.inputs.force_resync || github.event.client_payload.force_resync || 'false' }}
         run: |
-          # Usa inputs do workflow_dispatch se disponíveis
-          if [[ -n "${{ github.event.inputs.image_name }}" ]]; then
-            IMAGE_NAME="${{ github.event.inputs.image_name }}"
-            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
-            FORCE_RESYNC="${{ github.event.inputs.force_resync }}"
-          # Usa dados do repository_dispatch
-          elif [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
-            IMAGE_NAME="${{ github.event.client_payload.image_name }}"
-            IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
-            FORCE_RESYNC="${{ github.event.client_payload.force_resync || 'false' }}"
-          # Para execução agendada, verificar imagens predefinidas
-          else
-            # Lista de imagens a verificar na execução agendada
-            IMAGE_NAME="ethereum/client-go"
-            IMAGE_TAG="release-1.10"
-            FORCE_RESYNC="false"
-          fi
-          
-          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
-          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
-          echo "FORCE_RESYNC=${FORCE_RESYNC}" >> $GITHUB_ENV
-          
-          # Para GHCR, mantemos o formato completo
-          GHCR_IMAGE="ghcr.io/italoag/mirror/${IMAGE_NAME}:${IMAGE_TAG}"
-          echo "GHCR_IMAGE=${GHCR_IMAGE}" >> $GITHUB_ENV
+          set -euo pipefail
+          # Docker Hub mantém o caminho; outros registros entram no caminho do GHCR
+          # (quay.io/strimzi/kafka → ghcr.io/italoag/mirror/quay.io/strimzi/kafka).
+          RESOLVIDO="$(bash scripts/image-mirror.sh resolve "$IMAGE_NAME" "$IMAGE_TAG")"
+          {
+            echo "$RESOLVIDO"
+            echo "ORIGINAL_IMAGE=${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "FORCE_RESYNC=${FORCE_RESYNC}"
+          } >> "$GITHUB_ENV"
           
           # Log para depuração
-          echo "Imagem definida: ${IMAGE_NAME}:${IMAGE_TAG}"
-          echo "GHCR destino: ${GHCR_IMAGE}"
+          echo "$RESOLVIDO"
           echo "Forçar ressincronização: ${FORCE_RESYNC}"
       
-      - name: Verificar se a imagem existe no GHCR
-        id: check-ghcr
-        continue-on-error: true
-        env:
-          GHCR_AUTH_TOKEN: ${{ github.token }}
-        run: |
-          # Extrair caminho da imagem para o GHCR
-          if [[ "${{ env.IMAGE_NAME }}" == *"/"* ]]; then
-            # Imagem com namespace (ex: ethereum/client-go)
-            GHCR_PATH="italoag/mirror/${{ env.IMAGE_NAME }}"
-          else
-            # Imagem simples (ex: postgres)
-            GHCR_PATH="italoag/mirror/${{ env.IMAGE_NAME }}"
-          fi
-          
-          # Verificação HTTP para o manifesto da imagem no GHCR
-          GHCR_TOKEN_B64=$(printf '%s' "$GHCR_AUTH_TOKEN" | base64 -w0)
-          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $GHCR_TOKEN_B64" \
-            "https://ghcr.io/v2/${GHCR_PATH}/manifests/${{ env.IMAGE_TAG }}")
-          
-          echo "Status HTTP GHCR: $STATUS_CODE"
-          echo "URL verificada: https://ghcr.io/v2/${GHCR_PATH}/manifests/${{ env.IMAGE_TAG }}"
-          
-          if [[ "$STATUS_CODE" == "200" && "${{ env.FORCE_RESYNC }}" != "true" ]]; then
-            echo "IMAGEM_EXISTE=true" >> $GITHUB_ENV
-            echo "Imagem encontrada no GHCR e ressincronização não forçada"
-          else
-            if [[ "$STATUS_CODE" == "200" && "${{ env.FORCE_RESYNC }}" == "true" ]]; then
-              echo "Imagem encontrada no GHCR, mas será ressincronizada devido à flag de força"
-            else
-              echo "Imagem não encontrada no GHCR (Status: $STATUS_CODE)"
-            fi
-            echo "IMAGEM_EXISTE=false" >> $GITHUB_ENV
-          fi
+      - name: Garantir skopeo
+        run: command -v skopeo || { sudo apt-get update && sudo apt-get install -y skopeo; }
       
-      - name: Verificar imagem no Docker Hub e analisar plataformas
-        if: env.IMAGEM_EXISTE == 'false'
-        id: check-dockerhub
-        run: |
-          # Determinar se a imagem é oficial ou de namespace personalizado
-          if [[ "${{ env.IMAGE_NAME }}" == *"/"* ]]; then
-            # Imagem com namespace personalizado (ex: ethereum/client-go)
-            NAMESPACE=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f1)
-            IMAGE_SHORT=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f2-)
-            DOCKERHUB_REPO="${NAMESPACE}/${IMAGE_SHORT}"
-            DOCKERHUB_SCOPE="repository:${DOCKERHUB_REPO}:pull"
-          else
-            # Imagem oficial (ex: postgres, nginx)
-            DOCKERHUB_REPO="library/${{ env.IMAGE_NAME }}"
-            DOCKERHUB_SCOPE="repository:${DOCKERHUB_REPO}:pull"
-          fi
-          
-          echo "Verificando imagem no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }}"
-          
-          # Obter token de autenticação para o Docker Hub
-          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=${DOCKERHUB_SCOPE}" | jq -r .token)
-          
-          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-            echo "Erro ao obter token de autenticação para o Docker Hub"
-            echo "Escopo usado: ${DOCKERHUB_SCOPE}"
-            exit 1
-          fi
-          
-          # Verificar se o manifesto existe no Docker Hub
-          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
-            "https://registry-1.docker.io/v2/${DOCKERHUB_REPO}/manifests/${{ env.IMAGE_TAG }}")
-          
-          echo "Docker Hub Status: $STATUS_CODE"
-          
-          if [[ "$STATUS_CODE" == "200" || "$STATUS_CODE" == "307" ]]; then
-            echo "DOCKERHUB_EXISTE=true" >> $GITHUB_ENV
-            echo "DOCKERHUB_REPO=${DOCKERHUB_REPO}" >> $GITHUB_ENV
-            echo "Imagem encontrada no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }}"
-            
-            # Obter e analisar o manifesto para identificar plataformas suportadas
-            MANIFEST=$(curl -s \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
-              "https://registry-1.docker.io/v2/${DOCKERHUB_REPO}/manifests/${{ env.IMAGE_TAG }}")
-            
-            # Verificar se é um manifesto de lista (multi-arquitetura)
-            if echo "$MANIFEST" | jq -e '.manifests' > /dev/null; then
-              echo "A imagem é multi-arquitetura. Plataformas disponíveis:"
-              echo "$MANIFEST" | jq -r '.manifests[] | "- \(.platform.os)/\(.platform.architecture)\(.platform.variant // "")"'
-              
-              # Verificar se ARM64 está disponível
-              if echo "$MANIFEST" | jq -e '.manifests[] | select(.platform.architecture=="arm64")' > /dev/null; then
-                echo "ARM64 está disponível para esta imagem"
-                echo "ARM64_DISPONIVEL=true" >> $GITHUB_ENV
-              else
-                echo "ARM64 NÃO está disponível para esta imagem"
-                echo "ARM64_DISPONIVEL=false" >> $GITHUB_ENV
-              fi
-            else
-              echo "A imagem tem apenas uma arquitetura:"
-              echo "$MANIFEST" | jq -r '.architecture'
-              
-              if [[ "$(echo "$MANIFEST" | jq -r '.architecture')" == "arm64" ]]; then
-                echo "ARM64_DISPONIVEL=true" >> $GITHUB_ENV
-              else
-                echo "ARM64_DISPONIVEL=false" >> $GITHUB_ENV
-              fi
-            fi
-          else
-            echo "DOCKERHUB_EXISTE=false" >> $GITHUB_ENV
-            echo "Imagem não encontrada no Docker Hub: ${DOCKERHUB_REPO}:${{ env.IMAGE_TAG }} (Status: $STATUS_CODE)"
-            exit 1
-          fi
-      
-      # Usar a action oficial do Docker para login no GHCR
+      # O skopeo lê as credenciais que o login-action grava em ~/.docker/config.json
       - name: Login no GHCR
-        if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
         uses: docker/login-action@v3
         with:
           logout: false
@@ -195,62 +71,93 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
       
-      # Login no Docker Hub para garantir acesso completo às imagens
+      # Login no Docker Hub para evitar o rate limit de pulls anônimos
       - name: Login no Docker Hub
-        if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
+        if: startsWith(env.SOURCE_IMAGE, 'docker.io/')
         uses: docker/login-action@v3
         with:
           logout: false
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       
-      - name: Sincronizar imagem multi-arquitetura do Docker Hub para GHCR
-        if: env.IMAGEM_EXISTE == 'false' && env.DOCKERHUB_EXISTE == 'true'
+      - name: Verificar se a imagem existe no GHCR
         run: |
-          echo "Iniciando sincronização da imagem do Docker Hub para GHCR (com suporte multi-arquitetura)"
+          if skopeo inspect --raw "docker://${GHCR_IMAGE}" > /dev/null 2>&1; then
+            if [[ "$FORCE_RESYNC" == "true" ]]; then
+              echo "Imagem encontrada no GHCR, mas será ressincronizada devido à flag de força"
+              echo "SINCRONIZAR=true" >> "$GITHUB_ENV"
+            else
+              echo "Imagem encontrada no GHCR e ressincronização não forçada"
+              echo "SINCRONIZAR=false" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "Imagem não encontrada no GHCR: ${GHCR_IMAGE}"
+            echo "SINCRONIZAR=true" >> "$GITHUB_ENV"
+          fi
+      
+      - name: Verificar imagem na origem e analisar plataformas
+        if: env.SINCRONIZAR == 'true'
+        run: |
+          set -euo pipefail
+          if ! MANIFEST="$(skopeo inspect --raw "docker://${SOURCE_IMAGE}")"; then
+            echo "Imagem não encontrada na origem: ${SOURCE_IMAGE}"
+            exit 1
+          fi
+          echo "Imagem encontrada na origem: ${SOURCE_IMAGE}"
           
-          # Configurar buildx para melhor suporte multi-arquitetura
-          docker buildx create --use --name multi-arch-builder --driver docker-container --bootstrap
+          # Verificar se é um manifesto de lista (multi-arquitetura)
+          if echo "$MANIFEST" | jq -e '.manifests' > /dev/null; then
+            echo "A imagem é multi-arquitetura. Plataformas disponíveis:"
+            echo "$MANIFEST" | jq -r '.manifests[] | select(.platform) | "- \(.platform.os)/\(.platform.architecture)\(.platform.variant // "")"'
+            ARQUITETURAS="$(echo "$MANIFEST" | jq -r '[.manifests[].platform.architecture // empty] | join(" ")')"
+          else
+            ARQUITETURAS="$(skopeo inspect --format '{{.Architecture}}' "docker://${SOURCE_IMAGE}")"
+            echo "A imagem tem apenas uma arquitetura: ${ARQUITETURAS}"
+          fi
           
-          SOURCE_IMAGE="docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.IMAGE_TAG }}"
-          TARGET_IMAGE="${{ env.GHCR_IMAGE }}"
+          if [[ " ${ARQUITETURAS} " == *" arm64 "* ]]; then
+            echo "ARM64 está disponível para esta imagem"
+            echo "ARM64_DISPONIVEL=true" >> "$GITHUB_ENV"
+          else
+            echo "ARM64 NÃO está disponível para esta imagem"
+            echo "ARM64_DISPONIVEL=false" >> "$GITHUB_ENV"
+          fi
+      
+      - name: Sincronizar imagem multi-arquitetura para o GHCR
+        if: env.SINCRONIZAR == 'true'
+        run: |
+          set -euo pipefail
+          echo "Copiando ${SOURCE_IMAGE} → ${GHCR_IMAGE} (todas as arquiteturas)"
+          # skopeo copia o índice e todos os manifests, sem passar pelo daemon
+          skopeo copy --all --retry-times 3 "docker://${SOURCE_IMAGE}" "docker://${GHCR_IMAGE}"
           
-          # Inspecionar a imagem de origem para depuração
-          echo "Inspecionando o manifesto da imagem de origem:"
-          docker buildx imagetools inspect $SOURCE_IMAGE --raw
-          
-          # Usar uma abordagem mais direta para copiar a imagem com todas as arquiteturas
-          echo "Copiando a imagem com todas as arquiteturas disponíveis..."
-          
-          # Melhor abordagem com skopeo (mais confiável para copiar manifestos multi-plataforma)
-          # Instalar skopeo
-          sudo apt-get update && sudo apt-get install -y skopeo
-          
-          # Copiar imagem usando skopeo (preserva todos os manifests)
-          skopeo copy --all docker://$SOURCE_IMAGE docker://$TARGET_IMAGE
-          
-          echo "Sincronização com suporte multi-arquitetura completa para: $TARGET_IMAGE"
-          
-          # Verificar se a imagem de destino foi sincronizada corretamente
           echo "Inspecionando o manifesto da imagem sincronizada:"
-          docker buildx imagetools inspect $TARGET_IMAGE
+          skopeo inspect --raw "docker://${GHCR_IMAGE}" | jq .
       
       - name: Resultado da verificação
         run: |
-          if [[ "${{ env.IMAGEM_EXISTE }}" == "true" ]]; then
+          if [[ "$SINCRONIZAR" != "true" ]]; then
             echo "A imagem já existe no GHCR, nenhuma ação necessária."
-          elif [[ "${{ env.DOCKERHUB_EXISTE }}" != "true" ]]; then
-            echo "Erro: A imagem não foi encontrada no Docker Hub."
           else
-            echo "Imagem sincronizada com sucesso do Docker Hub para o GHCR."
+            echo "Imagem sincronizada com sucesso: ${SOURCE_IMAGE} → ${GHCR_IMAGE}"
             
-            if [[ "${{ env.ARM64_DISPONIVEL }}" == "true" ]]; then
+            if [[ "${ARM64_DISPONIVEL:-false}" == "true" ]]; then
               echo "A imagem inclui suporte para ARM64 (Apple Silicon)."
             else
               echo "ATENÇÃO: A imagem original NÃO tem suporte para ARM64 (Apple Silicon)."
             fi
             
-            if [[ "${{ env.FORCE_RESYNC }}" == "true" ]]; then
+            if [[ "$FORCE_RESYNC" == "true" ]]; then
               echo "A ressincronização forçada foi concluída."
             fi
           fi
+          
+          {
+            echo "### \`${ORIGINAL_IMAGE}\`"
+            echo
+            echo "Espelho: \`${GHCR_IMAGE}\`. Para usar com o nome original:"
+            echo
+            echo '```bash'
+            echo "docker pull ${GHCR_IMAGE} && docker tag ${GHCR_IMAGE} ${ORIGINAL_IMAGE}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
