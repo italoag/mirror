@@ -47,8 +47,8 @@ jobs:
                       script = passo.get("run")
                       if not script:
                           continue
-                      # As expressões ${{ }} são resolvidas antes do shell rodar.
-                      script = re.sub(r"\$\{\{[^}]*\}\}", "PLACEHOLDER", script)
+                      # As expressões do GitHub Actions são resolvidas antes do shell rodar.
+                      script = re.sub(r"\$\{\{.*?\}\}", "PLACEHOLDER", script, flags=re.DOTALL)
                       with tempfile.NamedTemporaryFile("w", suffix=".sh") as fh:
                           fh.write(script)
                           fh.flush()
