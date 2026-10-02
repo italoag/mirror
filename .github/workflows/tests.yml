@@ -24,6 +24,9 @@ jobs:
       - name: Compilar os scripts
         run: python3 -m compileall -q scripts tests
 
+      - name: Instalar PyYAML
+        run: python3 -m pip install pyyaml
+
       - name: Checar a sintaxe dos scripts de shell
         run: |
           set -euo pipefail
