@@ -69,7 +69,7 @@ jobs:
           logout: false
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+          password: ${{ secrets.GHCR_PAT || github.token }}
       
       # Login no Docker Hub para evitar o rate limit de pulls anônimos
       - name: Login no Docker Hub
